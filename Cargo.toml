@@ -1,0 +1,27 @@
+[package]
+name = "scanners-and-such"
+version = "0.1.0"
+edition = "2024"
+authors = ["Syfaro <syfaro@huefox.com>"]
+
+[features]
+default = ["snapi"]
+snapi = ["async-hid", "futures"]
+
+[dependencies]
+async-hid = { version = "0.4.4", optional = true, default-features = false, features = [
+    "async-io",
+    "winrt",
+] }
+futures = { version = "0.3.31", optional = true, default-features = false }
+hex = "0.4.3"
+itertools = "0.14.0"
+packed_struct = { version = "0.10.1", optional = true }
+tap = "1.0.1"
+thiserror = "2.0.17"
+tracing = "0.1.41"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+smol = "2.0.2"
+tracing-test = "0.2.5"
