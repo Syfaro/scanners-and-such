@@ -1,4 +1,8 @@
 use futures::StreamExt;
+use scanners_and_such::{
+    scanner::snapi,
+    transports::hid::{HidTransport, OpenableHidDevice, UsbFilter},
+};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -9,18 +13,29 @@ fn main() {
         .init();
 
     smol::block_on(async {
-        let mut snapi_devices = scanners_and_such::scanner::snapi::Snapi::discover_devices(true)
+        let mut devices =
+            scanners_and_such::transports::hid::HidDefaultTransport::get_devices(&[UsbFilter {
+                vendor_id: snapi::USB_VENDOR_ID,
+                product_id: snapi::USB_PRODUCT_ID,
+            }])
             .await
             .unwrap();
 
-        info!("{snapi_devices:#?}");
+        info!("{devices:#?}");
 
-        let Some(device) = snapi_devices.pop() else {
+        let Some(device) = devices.pop() else {
             warn!("no devices found");
             return;
         };
 
-        let (mut device, mut events) = device.open().await.unwrap();
+        let (device, events) = device
+            .open::<{ snapi::packet::PACKET_LEN }>()
+            .await
+            .unwrap();
+        let (mut device, mut events) = snapi::Snapi::new(device, events).await.unwrap();
+
+        let serial_number = device.get_attribute(534).await.unwrap();
+        info!(?serial_number);
 
         while let Some(event) = events.next().await {
             info!("got event: {}", hex::encode(&event));

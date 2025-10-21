@@ -1,4 +1,5 @@
 pub mod scanner;
+pub mod transports;
 
 pub(crate) mod runtime {
     #[cfg(feature = "runtime-smol")]
@@ -14,5 +15,10 @@ pub(crate) mod runtime {
         tokio::spawn(async move {
             fut.await;
         });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn spawn(fut: impl Future<Output = ()> + 'static) {
+        wasm_bindgen_futures::spawn_local(fut);
     }
 }
