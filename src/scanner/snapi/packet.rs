@@ -1,0 +1,501 @@
+use itertools::{Itertools, Position};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use tracing::{instrument, trace};
+
+use crate::scanner::snapi::{HidInput, HidOutput, SnapiError, code_types::CodeType};
+
+pub const PACKET_LEN: usize = 32;
+
+#[derive(Debug)]
+pub enum SnapiPacket {
+    Status(SnapiStatus),
+    Barcode(SnapiBarcodePacket),
+    Attribute(SnapiAttributePacket),
+    Other { hid_input: HidInput, data: Vec<u8> },
+}
+
+impl SnapiPacket {
+    pub fn decode_any(data: &[u8]) -> Result<Self, SnapiError> {
+        let packet = match HidInput::from(data[0]) {
+            HidInput::Status => SnapiStatus::decode(data)?.packet(),
+            HidInput::Barcode => SnapiBarcodePacket::decode(data)?.packet(),
+            HidInput::Attribute => SnapiAttributePacket::decode(data)?.packet(),
+            hid_input @ HidInput::Unknown(_) => SnapiPacket::Other {
+                hid_input,
+                data: data.to_vec(),
+            },
+        };
+
+        Ok(packet)
+    }
+
+    pub fn decode_specific<T: DecodableSnapiPacket>(data: &[u8]) -> Result<T, SnapiError> {
+        let hid_input = HidInput::from(data[0]);
+
+        if hid_input != T::HID_INPUT {
+            return Err(SnapiError::UnexpectedValue {
+                value: data[0],
+                name: "decode".into(),
+            });
+        }
+
+        T::decode(data)
+    }
+}
+
+pub trait DecodableSnapiPacket: Sized {
+    const HID_INPUT: HidInput;
+
+    fn decode(data: &[u8]) -> Result<Self, SnapiError>;
+
+    fn packet(self) -> SnapiPacket;
+}
+
+pub trait CollatableSnapiPacket: Sized {
+    type Output: SnapiPacketOutput;
+
+    fn collate(self, packets: &mut Vec<Self>) -> Result<Self::Output, SnapiError>;
+}
+
+pub trait SnapiPacketOutput: Sized {
+    fn output(self) -> Option<SnapiOutput>;
+}
+
+impl<T: SnapiPacketOutput> SnapiPacketOutput for Option<T> {
+    fn output(self) -> Option<SnapiOutput> {
+        match self {
+            Some(output) => output.output(),
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SnapiStatus {
+    pub hid_output: HidOutput,
+    pub response_code: SnapiResponseCode,
+    pub extended_response_code: SnapiExtendedResponseCode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, TryFromPrimitive, IntoPrimitive)]
+#[repr(u8)]
+pub enum SnapiResponseCode {
+    Success = 0x01,
+    Fail = 0x02,
+    NotSupported = 0x03,
+    SupportedNotCompleted = 0x04,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, TryFromPrimitive, IntoPrimitive)]
+#[repr(u8)]
+pub enum SnapiExtendedResponseCode {
+    Empty = 0x00,
+    AllParametersStored = 0x01,
+    NoParametersStored = 0x02,
+    SomeParametersStored = 0x03,
+}
+
+impl SnapiStatus {
+    pub fn error_for_status(self) -> Result<(), SnapiError> {
+        trace!(hid_output = ?self.hid_output, response_code = ?self.response_code, "checking status");
+        match self.response_code {
+            SnapiResponseCode::Success => Ok(()),
+            _ => Err(SnapiError::BadStatus { status: self }),
+        }
+    }
+}
+
+impl DecodableSnapiPacket for SnapiStatus {
+    const HID_INPUT: HidInput = HidInput::Status;
+
+    fn decode(data: &[u8]) -> Result<Self, SnapiError> {
+        Ok(SnapiStatus {
+            hid_output: HidOutput::from(data[1]),
+            response_code: data[2]
+                .try_into()
+                .map_err(|_| SnapiError::UnexpectedValue {
+                    value: data[2],
+                    name: "response code".into(),
+                })?,
+            extended_response_code: data[3].try_into().map_err(|_| {
+                SnapiError::UnexpectedValue {
+                    value: data[2],
+                    name: "extended response code".into(),
+                }
+            })?,
+        })
+    }
+
+    fn packet(self) -> SnapiPacket {
+        SnapiPacket::Status(self)
+    }
+}
+
+impl CollatableSnapiPacket for SnapiStatus {
+    type Output = SnapiStatus;
+
+    fn collate(self, _packets: &mut Vec<Self>) -> Result<Self::Output, SnapiError> {
+        Ok(self)
+    }
+}
+
+impl SnapiPacketOutput for SnapiStatus {
+    fn output(self) -> Option<SnapiOutput> {
+        Some(SnapiOutput::Status(self))
+    }
+}
+
+#[derive(Debug)]
+pub struct SnapiBarcodePacket {
+    pub packet_count: usize,
+    pub packet_index: usize,
+
+    pub code_type: CodeType,
+    pub data: Vec<u8>,
+}
+
+impl DecodableSnapiPacket for SnapiBarcodePacket {
+    const HID_INPUT: HidInput = HidInput::Barcode;
+
+    fn decode(data: &[u8]) -> Result<Self, SnapiError> {
+        let packet_count = usize::from(data[1]);
+        let packet_index = usize::from(data[2]);
+        let length = usize::from(data[3]);
+        let code_type = CodeType::from(u16::from_le_bytes([data[4], data[5]]));
+        let data = data[6..(6 + length)].to_vec();
+
+        Ok(Self {
+            packet_count,
+            packet_index,
+            code_type,
+            data,
+        })
+    }
+
+    fn packet(self) -> SnapiPacket {
+        SnapiPacket::Barcode(self)
+    }
+}
+
+impl CollatableSnapiPacket for SnapiBarcodePacket {
+    type Output = Option<SnapiBarcode>;
+
+    fn collate(self, packets: &mut Vec<Self>) -> Result<Self::Output, SnapiError> {
+        if self.packet_count == 1 {
+            trace!("got single packet barcode");
+
+            if !packets.is_empty() {
+                packets.clear();
+                return Err(SnapiError::BadPacketOrder {
+                    name: format!("expected 0 previous packets, had {}", packets.len()).into(),
+                });
+            }
+
+            Ok(Some(SnapiBarcode {
+                data: self.data,
+                code_type: self.code_type,
+            }))
+        } else if self.packet_count == self.packet_index + 1 {
+            trace!(count = self.packet_count, "got last packet in barcode");
+
+            let expected_count = self.packet_count;
+            let code_type = self.code_type;
+
+            packets.push(self);
+
+            if packets.len() != expected_count {
+                packets.clear();
+                return Err(SnapiError::BadPacketOrder {
+                    name: format!("expected {expected_count} packets, had {}", packets.len())
+                        .into(),
+                });
+            }
+
+            let packets = std::mem::take(packets);
+
+            let data = packets.into_iter().flat_map(|packet| packet.data).collect();
+
+            Ok(Some(SnapiBarcode { data, code_type }))
+        } else {
+            let packet_index = self.packet_index;
+            trace!(
+                packet_index,
+                packet_count = self.packet_count,
+                "got packet of barcode",
+            );
+
+            packets.push(self);
+
+            if packets.len() != packet_index + 1 {
+                packets.clear();
+                return Err(SnapiError::BadPacketOrder {
+                    name: format!("on packet index {packet_index} but had {}", packets.len())
+                        .into(),
+                });
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+impl SnapiPacketOutput for SnapiBarcode {
+    fn output(self) -> Option<SnapiOutput> {
+        Some(SnapiOutput::Barcode(self))
+    }
+}
+
+#[derive(Debug)]
+pub struct SnapiAttributePacket {
+    pub flags: SnapiAttributeResponseFlags,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct SnapiAttributeResponseFlags {
+    pub has_next: bool,
+}
+
+impl From<u8> for SnapiAttributeResponseFlags {
+    fn from(value: u8) -> Self {
+        Self {
+            has_next: value & 0b00010000 > 0,
+        }
+    }
+}
+
+impl From<SnapiAttributeResponseFlags> for u8 {
+    fn from(value: SnapiAttributeResponseFlags) -> Self {
+        (value.has_next as u8) << 5
+    }
+}
+
+impl DecodableSnapiPacket for SnapiAttributePacket {
+    const HID_INPUT: HidInput = HidInput::Attribute;
+
+    fn decode(data: &[u8]) -> Result<Self, SnapiError> {
+        let has_next = data[1] & 0b00010000 > 0;
+        let length = usize::from(data[2]);
+        let data = data[3..(3 + length)].to_vec();
+
+        Ok(Self {
+            flags: SnapiAttributeResponseFlags { has_next },
+            data,
+        })
+    }
+
+    fn packet(self) -> SnapiPacket {
+        SnapiPacket::Attribute(self)
+    }
+}
+
+impl CollatableSnapiPacket for SnapiAttributePacket {
+    type Output = Option<Option<SnapiAttributeValue>>;
+
+    fn collate(self, packets: &mut Vec<Self>) -> Result<Self::Output, SnapiError> {
+        let has_next = self.flags.has_next;
+        trace!(has_next, "processing attribute packet");
+
+        packets.push(self);
+
+        if has_next {
+            return Ok(None);
+        }
+
+        let data: Vec<_> = std::mem::take(packets)
+            .into_iter()
+            .flat_map(|attribute| attribute.data)
+            .collect();
+        trace!("got packet data: {}", hex::encode(&data));
+        let value = SnapiAttributeValue::decode(&data)?;
+        trace!(?value, "got attribute value");
+
+        Ok(Some(value))
+    }
+}
+
+impl SnapiPacketOutput for Option<SnapiAttributeValue> {
+    fn output(self) -> Option<SnapiOutput> {
+        Some(SnapiOutput::Attribute(self))
+    }
+}
+
+#[derive(Debug)]
+pub enum SnapiOutput {
+    Status(SnapiStatus),
+    Barcode(SnapiBarcode),
+    Attribute(Option<SnapiAttributeValue>),
+    Other { hid_input: HidInput, data: Vec<u8> },
+}
+
+#[derive(Debug)]
+pub struct SnapiBarcode {
+    pub data: Vec<u8>,
+    pub code_type: CodeType,
+}
+
+#[derive(Debug)]
+pub enum SnapiAttributeValue {
+    Flag(bool),
+    Byte(u8),
+    Word(u16),
+    DWord(u32),
+    String(String),
+    Array(Vec<u8>),
+}
+
+impl SnapiAttributeValue {
+    pub fn decode(data: &[u8]) -> Result<Option<Self>, SnapiError> {
+        if data.len() < 6 {
+            return Ok(None);
+        }
+
+        let value = match data[6] {
+            b'F' => SnapiAttributeValue::Flag(data[8] > 0),
+            b'B' => SnapiAttributeValue::Byte(data[8]),
+            b'W' => SnapiAttributeValue::Word(u16::from_le_bytes([data[8], data[9]])),
+            b'D' => SnapiAttributeValue::DWord(u32::from_le_bytes([
+                data[8], data[9], data[10], data[11],
+            ])),
+            b'S' => {
+                // Strings are null terminated, ignore the last byte.
+                let data = &data[12..12 + usize::from(data[9]) - 1];
+                trace!("attempting to parse string from {}", hex::encode(data));
+                SnapiAttributeValue::String(String::from_utf8(data.to_vec()).map_err(|err| {
+                    SnapiError::InvalidString {
+                        data: err.into_bytes(),
+                    }
+                })?)
+            }
+            b'A' => todo!(),
+            0 => return Ok(None),
+            value => {
+                return Err(SnapiError::UnexpectedValue {
+                    value,
+                    name: "attribute type".into(),
+                });
+            }
+        };
+
+        Ok(Some(value))
+    }
+}
+
+/// Encode a SNAPI attribute request into as many packets as are needed.
+///
+/// Data may not be longer than `u16::MAX` otherwise this function will panic.
+#[instrument]
+pub(crate) fn encode_attribute_request(data: &[u8]) -> impl Iterator<Item = Vec<u8>> {
+    let total_length = u16::try_from(data.len()).unwrap().to_be_bytes();
+
+    // Each packet can be up to the maximum length minus the 4 header bytes, so
+    // we can chunk the data on that size. We also need to know the position of
+    // the chunk we're looking at to ensure the start and has_next flags can be
+    // correctly set.
+    data.chunks(PACKET_LEN - 4)
+        .with_position()
+        .map(move |(pos, chunk)| {
+            trace!(?pos, len = chunk.len(), "needs packet for data");
+
+            let flags = SnapiAttributeRequestFlags {
+                has_next: !matches!(pos, Position::Only | Position::Last),
+                start: matches!(pos, Position::First | Position::Only),
+            };
+            trace!(?flags, "got packet flags");
+
+            let mut packet = Vec::with_capacity(PACKET_LEN);
+            packet.push(HidOutput::Attribute.into());
+            packet.push(flags.into());
+            packet.extend_from_slice(&total_length);
+            packet.extend_from_slice(chunk);
+
+            if packet.len() < PACKET_LEN {
+                packet.extend(std::iter::repeat_n(0x00, PACKET_LEN - packet.len()));
+            }
+
+            debug_assert!(
+                packet.len() <= PACKET_LEN,
+                "snapi packet must be at most {PACKET_LEN} bytes long, was {} bytes",
+                packet.len()
+            );
+
+            packet
+        })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct SnapiAttributeRequestFlags {
+    pub has_next: bool,
+    pub start: bool,
+}
+
+impl From<u8> for SnapiAttributeRequestFlags {
+    fn from(value: u8) -> Self {
+        Self {
+            has_next: value & 0b10000000 > 0,
+            start: value & 0b01000000 > 0,
+        }
+    }
+}
+
+impl From<SnapiAttributeRequestFlags> for u8 {
+    fn from(value: SnapiAttributeRequestFlags) -> Self {
+        ((value.has_next as u8) << 7) | ((value.start as u8) << 6)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing_test::traced_test;
+
+    use super::*;
+
+    #[test]
+    fn test_snapi_attribute_request_flags() {
+        assert_eq!(
+            SnapiAttributeRequestFlags::from(0b11000000),
+            SnapiAttributeRequestFlags {
+                has_next: true,
+                start: true
+            }
+        );
+
+        assert_eq!(
+            SnapiAttributeRequestFlags::from(0b00000000),
+            SnapiAttributeRequestFlags {
+                has_next: false,
+                start: false
+            }
+        );
+
+        assert_eq!(
+            <SnapiAttributeRequestFlags as Into<u8>>::into(SnapiAttributeRequestFlags {
+                has_next: true,
+                start: true
+            }),
+            0b11000000 as u8
+        );
+
+        assert_eq!(
+            <SnapiAttributeRequestFlags as Into<u8>>::into(SnapiAttributeRequestFlags {
+                has_next: false,
+                start: false
+            }),
+            0b00000000 as u8
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_snapi_encode_attribute_request() {
+        let packets: Vec<_> =
+            encode_attribute_request(&[0x00, 0x06, 0x01, 0x00, 0x00, 0x00]).collect();
+
+        assert_eq!(
+            packets,
+            vec![vec![
+                0x0D, 0x40, 0x00, 0x06, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00
+            ]]
+        );
+    }
+}
