@@ -28,16 +28,16 @@ fn main() {
             return;
         };
 
-        let (device, events) = device
+        let (device, packets) = device
             .open::<{ snapi::packet::PACKET_LEN }>()
             .await
             .unwrap();
-        let (mut device, mut events) = snapi::Snapi::new(device, events).await.unwrap();
+        let (mut device, mut packets) = snapi::Snapi::new(device, packets).await.unwrap();
 
         let serial_number = device.get_attribute(534).await.unwrap();
         info!(?serial_number);
 
-        while let Some(event) = events.next().await {
+        while let Some(event) = packets.next().await {
             info!("got event: {}", hex::encode(&event));
 
             match device.process_packet(event).await {

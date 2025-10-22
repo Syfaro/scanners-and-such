@@ -4,7 +4,8 @@ use futures::{Stream, StreamExt, TryFutureExt, future};
 use tracing::error;
 
 use crate::transports::hid::{
-    HidDiscoveredDevice, HidError, HidTransport, OpenableHidDevice, UsbFilter, WritableHidDevice,
+    ClosableHidDevice, HidDiscoveredDevice, HidError, HidTransport, OpenableHidDevice, UsbFilter,
+    WritableHidDevice,
 };
 
 impl HidError {
@@ -24,9 +25,7 @@ pub struct HidDevice {
 
 #[async_trait(?Send)]
 impl HidTransport for HidTransportNative {
-    async fn get_devices(
-        filters: &[UsbFilter],
-    ) -> Result<Vec<HidDiscoveredDevice>, HidError> {
+    async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<HidDiscoveredDevice>, HidError> {
         let backend = async_hid::HidBackend::default();
         let devices = backend
             .enumerate()
@@ -84,5 +83,14 @@ impl WritableHidDevice for HidDevice {
             .write_output_report(data)
             .await
             .map_err(|err| HidError::new("could not write output report", Some(err)))
+    }
+}
+
+#[async_trait(?Send)]
+impl ClosableHidDevice for HidDevice {
+    async fn close(&mut self) -> Result<(), HidError> {
+        // We don't have exclusive use over HID devices on native platforms, so
+        // nothing needs to happen here.
+        Ok(())
     }
 }

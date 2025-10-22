@@ -9,7 +9,8 @@ use web_sys::{
 };
 
 use crate::transports::hid::{
-    HidDiscoveredDevice, HidError, HidTransport, OpenableHidDevice, UsbFilter, WritableHidDevice,
+    ClosableHidDevice, HidDiscoveredDevice, HidError, HidTransport, OpenableHidDevice, UsbFilter,
+    WritableHidDevice,
 };
 
 impl HidError {
@@ -161,6 +162,19 @@ impl WritableHidDevice for HidDevice {
         JsFuture::from(promise)
             .await
             .map_err(|err| HidError::new("failed to write report", Some(err)))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl ClosableHidDevice for HidDevice {
+    async fn close(&mut self) -> Result<(), HidError> {
+        let promise = self.device.close();
+
+        JsFuture::from(promise)
+            .await
+            .map_err(|err| HidError::new("failed to close device", Some(err)))?;
 
         Ok(())
     }

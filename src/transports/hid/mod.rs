@@ -21,15 +21,20 @@ pub struct HidError {
     pub message: String,
 
     #[cfg(not(target_arch = "wasm32"))]
-    inner: Option<async_hid::HidError>,
+    pub inner: Option<async_hid::HidError>,
     #[cfg(target_arch = "wasm32")]
-    inner: Option<web_sys::wasm_bindgen::JsValue>,
+    pub inner: Option<web_sys::wasm_bindgen::JsValue>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type HidDefaultTransport = native::HidTransportNative;
+#[cfg(not(target_arch = "wasm32"))]
+pub type HidDefaultDevice = native::HidDevice;
+
 #[cfg(target_arch = "wasm32")]
 pub type HidDefaultTransport = web::HidTransportWeb;
+#[cfg(target_arch = "wasm32")]
+pub type HidDefaultDevice = web::HidDevice;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,11 +50,16 @@ pub trait HidTransport {
 
 #[async_trait(?Send)]
 pub trait OpenableHidDevice {
-    type Device: WritableHidDevice;
+    type Device: WritableHidDevice + ClosableHidDevice;
 
     async fn open<const PACKET_LEN: usize>(
         self,
     ) -> Result<(Self::Device, impl Stream<Item = Vec<u8>> + Send), HidError>;
+}
+
+#[async_trait(?Send)]
+pub trait ClosableHidDevice {
+    async fn close(&mut self) -> Result<(), HidError>;
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

@@ -1,6 +1,7 @@
 use itertools::{Itertools, Position};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use tracing::{instrument, trace};
+use serde::Serialize;
+use tracing::{instrument, trace, warn};
 
 use crate::scanner::snapi::{HidInput, HidOutput, SnapiError, code_types::CodeType};
 
@@ -70,7 +71,8 @@ impl<T: SnapiPacketOutput> SnapiPacketOutput for Option<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapiStatus {
     pub hid_output: HidOutput,
     pub response_code: SnapiResponseCode,
@@ -86,6 +88,15 @@ pub enum SnapiResponseCode {
     SupportedNotCompleted = 0x04,
 }
 
+impl serde::Serialize for SnapiResponseCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8((*self).into())
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum SnapiExtendedResponseCode {
@@ -95,11 +106,26 @@ pub enum SnapiExtendedResponseCode {
     SomeParametersStored = 0x03,
 }
 
+impl serde::Serialize for SnapiExtendedResponseCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8((*self).into())
+    }
+}
+
 impl SnapiStatus {
-    pub fn error_for_status(self) -> Result<(), SnapiError> {
-        trace!(hid_output = ?self.hid_output, response_code = ?self.response_code, "checking status");
+    pub fn error_for_status(self, expected_hid_output: HidOutput) -> Result<(), SnapiError> {
+        trace!(
+            hid_output = ?self.hid_output,
+            response_code = ?self.response_code,
+            ?expected_hid_output,
+            "checking status"
+        );
+
         match self.response_code {
-            SnapiResponseCode::Success => Ok(()),
+            SnapiResponseCode::Success if self.hid_output == expected_hid_output => Ok(()),
             _ => Err(SnapiError::BadStatus { status: self }),
         }
     }
@@ -320,7 +346,8 @@ impl SnapiPacketOutput for Option<SnapiAttributeValue> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type", content = "value")]
 pub enum SnapiOutput {
     Status(SnapiStatus),
     Barcode(SnapiBarcode),
@@ -328,13 +355,15 @@ pub enum SnapiOutput {
     Other { hid_input: HidInput, data: Vec<u8> },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapiBarcode {
     pub data: Vec<u8>,
     pub code_type: CodeType,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase", tag = "type", content = "value")]
 pub enum SnapiAttributeValue {
     Flag(bool),
     Byte(u8),
@@ -346,7 +375,7 @@ pub enum SnapiAttributeValue {
 
 impl SnapiAttributeValue {
     pub fn decode(data: &[u8]) -> Result<Option<Self>, SnapiError> {
-        if data.len() < 6 {
+        if data.len() < 7 {
             return Ok(None);
         }
 
@@ -361,11 +390,16 @@ impl SnapiAttributeValue {
                 // Strings are null terminated, ignore the last byte.
                 let data = &data[12..12 + usize::from(data[9]) - 1];
                 trace!("attempting to parse string from {}", hex::encode(data));
-                SnapiAttributeValue::String(String::from_utf8(data.to_vec()).map_err(|err| {
-                    SnapiError::InvalidString {
-                        data: err.into_bytes(),
-                    }
-                })?)
+                String::from_utf8(data.to_vec())
+                    .map(SnapiAttributeValue::String)
+                    .unwrap_or_else(|err| {
+                        let bytes = err.into_bytes();
+                        warn!(
+                            "expected string but not valid utf-8, returning as array: {}",
+                            hex::encode(&bytes)
+                        );
+                        SnapiAttributeValue::Array(bytes)
+                    })
             }
             b'A' => todo!(),
             0 => return Ok(None),

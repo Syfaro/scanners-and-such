@@ -3,14 +3,14 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use futures::{
     SinkExt, Stream, StreamExt,
     channel::{mpsc, oneshot},
-    lock::Mutex,
 };
 use num_enum::{FromPrimitive, IntoPrimitive};
-use tracing::{Instrument, debug, error, instrument, trace};
+use serde::Serialize;
+use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     scanner::snapi::packet::*,
-    transports::hid::{HidError, WritableHidDevice},
+    transports::hid::{ClosableHidDevice, HidError, WritableHidDevice},
 };
 
 pub mod code_types;
@@ -19,7 +19,8 @@ pub mod packet;
 pub const USB_VENDOR_ID: u16 = 0x05E0;
 pub const USB_PRODUCT_ID: u16 = 0x1900;
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive, Serialize)]
+#[serde(rename_all = "camelCase")]
 #[repr(u8)]
 pub enum HidInput {
     Status = 0x21,
@@ -29,7 +30,8 @@ pub enum HidInput {
     Unknown(u8),
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive, Serialize)]
+#[serde(rename_all = "camelCase")]
 #[repr(u8)]
 pub enum HidOutput {
     Acknowledgement = 0x01,
@@ -49,8 +51,6 @@ pub enum SnapiError {
     UnexpectedValue { value: u8, name: Cow<'static, str> },
     #[error("got bad response code: {:?}", status.response_code)]
     BadStatus { status: SnapiStatus },
-    #[error("attribute string was not valid utf-8")]
-    InvalidString { data: Vec<u8> },
     #[error("encountered error when using channel: {name}")]
     Channel { name: &'static str },
     #[error("packets were missing or out of order: {name}")]
@@ -60,29 +60,42 @@ pub enum SnapiError {
 /// A SNAPI device.
 pub struct Snapi<W> {
     wtr: W,
+    is_connected: bool,
 
-    pending: Pending<Vec<u8>>,
+    pending: Arc<Pending<Vec<u8>>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    reader_ended_rx: Option<oneshot::Receiver<()>>,
 
     barcode_packets: Vec<SnapiBarcodePacket>,
     attribute_packets: Vec<SnapiAttributePacket>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive)]
+#[repr(u8)]
+pub enum MacroPdfAction {
+    Flush = 0x00,
+    Abort = 0x01,
+}
+
 impl<W: WritableHidDevice> Snapi<W> {
-    /// Create a new SNAPI device from a HID device and initializes it.
+    /// Create a new SNAPI device from a HID device and initialize it.
     pub async fn new(
         wtr: W,
-        events: impl Stream<Item = Vec<u8>> + Send + 'static,
+        packets: impl Stream<Item = Vec<u8>> + Send + 'static,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SnapiError> {
         let (others_tx, others_rx) = mpsc::channel(8);
         let pending = Pending::new(others_tx);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (reader_ended_tx, reader_ended_rx) = oneshot::channel();
 
         let mut snapi_device = Self {
             wtr,
-            pending: pending.clone(),
+            is_connected: true,
+
+            pending: Arc::clone(&pending),
             shutdown_tx: Some(shutdown_tx),
+            reader_ended_rx: Some(reader_ended_rx),
 
             barcode_packets: Vec::new(),
             attribute_packets: Vec::new(),
@@ -90,11 +103,125 @@ impl<W: WritableHidDevice> Snapi<W> {
 
         // Spawn reader after creating device, because now device will send a
         // message to the shutdown channel when dropped.
-        SnapiReader::start(events, pending, shutdown_rx);
+        SnapiReader::start(packets, pending, shutdown_rx, reader_ended_tx);
 
         snapi_device.initialize_device().await?;
 
         Ok((snapi_device, others_rx))
+    }
+
+    /// Write an acknowledgement packet.
+    ///
+    /// Note that is only needed if you're not using the
+    /// [`Snapi::process_packet`] function, as that handles this automatically.
+    #[instrument(skip(self, input))]
+    pub async fn write_ack(&mut self, input: HidInput) -> Result<(), SnapiError> {
+        self.write_command(
+            HidOutput::Acknowledgement,
+            &mut [HidOutput::Acknowledgement.into(), input.into(), 0x01],
+            false,
+        )
+        .await
+    }
+
+    /// Set if the aiming dot should be enabled.
+    #[instrument(skip(self))]
+    pub async fn set_aim(&mut self, enabled: bool) -> Result<(), SnapiError> {
+        self.write_command(
+            HidOutput::Aim,
+            &mut [HidOutput::Aim.into(), enabled as u8],
+            true,
+        )
+        .await
+    }
+
+    /// Set if the scanner should be enabled.
+    #[instrument(skip(self))]
+    pub async fn set_scanner(&mut self, enabled: bool) -> Result<(), SnapiError> {
+        self.write_command(
+            HidOutput::Scanner,
+            &mut [HidOutput::Scanner.into(), enabled as u8],
+            true,
+        )
+        .await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn send_macro_pdf_action(
+        &mut self,
+        action: MacroPdfAction,
+    ) -> Result<(), SnapiError> {
+        self.write_command(
+            HidOutput::MacroPdf,
+            &mut [HidOutput::MacroPdf.into(), action.into()],
+            true,
+        )
+        .await
+    }
+
+    /// Perform a simple command that produces no return value, and optionally
+    /// checks the status.
+    #[instrument(skip(self, packet))]
+    async fn write_command(
+        &mut self,
+        hid_output: HidOutput,
+        packet: &mut [u8],
+        read_status: bool,
+    ) -> Result<(), SnapiError> {
+        trace!("writing command: {}", hex::encode(&packet));
+
+        debug_assert!(
+            hid_output == HidOutput::from(packet[0]),
+            "first byte of packet must match hid output, expected {hid_output:?}, got {:?}",
+            HidOutput::from(packet[0])
+        );
+
+        if read_status {
+            Arc::clone(&self.pending)
+                .input_single(HidInput::Status, async move |mut rx| {
+                    self.wtr.write_report(packet).await?;
+
+                    trace!("reading status");
+                    self.read_status(&mut rx)
+                        .await?
+                        .error_for_status(hid_output)?;
+
+                    Ok(())
+                })
+                .await?;
+        } else {
+            self.wtr.write_report(packet).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get the value of an attribute by ID.
+    #[instrument(skip(self))]
+    pub async fn get_attribute(
+        &mut self,
+        attribute_id: u16,
+    ) -> Result<Option<SnapiAttributeValue>, SnapiError> {
+        let mut command = Vec::with_capacity(6);
+        command.extend_from_slice(&[0x00, 0x06, 0x02, 0x00]);
+        command.extend_from_slice(&attribute_id.to_be_bytes());
+
+        let value = self.write_attribute_command(&command).await?;
+
+        Ok(value)
+    }
+
+    /// Read a single status packet.
+    #[instrument(skip(self))]
+    async fn read_status(
+        &mut self,
+        rx: &mut oneshot::Receiver<Vec<u8>>,
+    ) -> Result<SnapiStatus, SnapiError> {
+        let buf = rx
+            .await
+            .map_err(|_| SnapiError::Channel { name: "rx status" })?;
+
+        SnapiPacket::decode_specific(&buf)
     }
 
     /// Initialize the device.
@@ -116,19 +243,6 @@ impl<W: WritableHidDevice> Snapi<W> {
         Ok(())
     }
 
-    /// Get the value of an attribute by ID.
-    #[instrument(skip(self))]
-    pub async fn get_attribute(
-        &mut self,
-        attribute_id: u16,
-    ) -> Result<Option<SnapiAttributeValue>, SnapiError> {
-        let mut command = Vec::with_capacity(6);
-        command.extend_from_slice(&[0x00, 0x06, 0x02, 0x00]);
-        command.extend_from_slice(&attribute_id.to_be_bytes());
-
-        self.write_attribute_command(&command).await
-    }
-
     /// Encodes an attribute command into as many packets are as needed and send
     /// them all.
     #[instrument(skip_all)]
@@ -136,76 +250,41 @@ impl<W: WritableHidDevice> Snapi<W> {
         &mut self,
         command: &[u8],
     ) -> Result<Option<SnapiAttributeValue>, SnapiError> {
-        for mut packet in encode_attribute_request(command) {
-            trace!("writing command packet: {}", hex::encode(&packet));
-            self.wtr.write_report(&mut packet).await?;
-            self.read_status().await?.error_for_status()?;
-        }
-
-        self.read_attribute().await
-    }
-
-    /// Write an acknowledgement packet.
-    ///
-    /// Note that is only needed if you're not using the
-    /// [`Snapi::process_packet`] function, as that handles this automatically.
-    #[instrument(skip(self, input))]
-    pub async fn write_ack(&mut self, input: HidInput) -> Result<(), SnapiError> {
-        let mut packet = [0x01, input.into(), 0x01];
-        trace!(?input, "writing ack: {}", hex::encode(packet));
-        self.wtr.write_report(&mut packet).await?;
-
-        Ok(())
-    }
-
-    /// Read a single status packet.
-    #[instrument(skip(self))]
-    async fn read_status(&mut self) -> Result<SnapiStatus, SnapiError> {
-        let pending = self.pending.clone();
-        let buf = pending
-            .input_single(self, HidInput::Status, |_, rx| async move {
-                rx.await
-                    .map_err(|_| SnapiError::Channel { name: "rx status" })
-            })
-            .await?;
-
-        SnapiPacket::decode_specific(&buf)
-    }
-
-    /// Reads an attribute value.
-    #[instrument(skip(self))]
-    async fn read_attribute(&mut self) -> Result<Option<SnapiAttributeValue>, SnapiError> {
-        let pending = self.pending.clone();
-        let value = pending
-            .input_multi(self, HidInput::Attribute, |device, mut rx| {
-                async move {
-                    loop {
-                        trace!("waiting for attribute response");
-
-                        let buf = rx.next().await.ok_or_else(|| SnapiError::Channel {
-                            name: "attribute response",
-                        })?;
-                        let value = buf[0];
-
-                        let output = device.process_packet(buf).await?;
-
-                        match output {
-                            Some(SnapiOutput::Attribute(attribute)) => return Ok(attribute),
-                            Some(_) => {
-                                return Err(SnapiError::UnexpectedValue {
-                                    value,
-                                    name: "attribute".into(),
-                                });
-                            }
-                            None => continue,
-                        }
-                    }
+        let value = Arc::clone(&self.pending)
+            .input_multi(HidInput::Attribute, async move |mut rx| {
+                for mut packet in encode_attribute_request(command) {
+                    self.write_command(HidOutput::Attribute, &mut packet, true)
+                        .await?;
                 }
-                .in_current_span()
+
+                let value = loop {
+                    trace!("waiting for attribute response");
+
+                    let buf = rx.next().await.ok_or_else(|| SnapiError::Channel {
+                        name: "attribute response",
+                    })?;
+                    let value = buf[0];
+
+                    let output = self.process_packet(buf).await?;
+
+                    match output {
+                        Some(SnapiOutput::Attribute(attribute)) => break attribute,
+                        Some(_) => {
+                            return Err(SnapiError::UnexpectedValue {
+                                value,
+                                name: "attribute".into(),
+                            });
+                        }
+                        None => continue,
+                    }
+                };
+
+                Ok(value)
             })
             .await?;
 
         trace!("got attribute value: {value:?}");
+
         Ok(value)
     }
 
@@ -241,12 +320,40 @@ impl<W: WritableHidDevice> Snapi<W> {
     }
 }
 
-impl<W> Drop for Snapi<W> {
-    fn drop(&mut self) {
+impl<W: ClosableHidDevice> Snapi<W> {
+    pub async fn close(mut self) -> Result<(), SnapiError> {
+        self.is_connected = false;
+
+        self.shutdown();
+
+        if let Some(reader_ended_rx) = self.reader_ended_rx.take() {
+            reader_ended_rx.await.map_err(|_| SnapiError::Channel {
+                name: "reader ended",
+            })?;
+        }
+
+        self.wtr.close().await?;
+
+        Ok(())
+    }
+}
+
+impl<W> Snapi<W> {
+    fn shutdown(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             debug!("shutting down snapi device");
             // We don't care if this call fails as we're done with the device.
             let _ = shutdown_tx.send(());
+        }
+    }
+}
+
+impl<W> Drop for Snapi<W> {
+    fn drop(&mut self) {
+        self.shutdown();
+
+        if self.is_connected {
+            warn!("dropped snapi device while connected, please close first");
         }
     }
 }
@@ -256,27 +363,28 @@ impl<W> Drop for Snapi<W> {
 /// When we make certain calls, we need to make sure we use those packets and
 /// prevent them from entering the general event stream. This is done by
 /// registering the expected output with a channel for processing.
-#[derive(Clone)]
 struct Pending<T> {
-    others: Arc<Mutex<mpsc::Sender<T>>>,
-    pending: Arc<Mutex<HashMap<HidInput, PendingSender<T>>>>,
+    /// The general event stream for non-reserved packets.
+    others: futures::lock::Mutex<mpsc::Sender<T>>,
+    /// A collection of subscribers for specific HID inputs.
+    subscribers: futures::lock::Mutex<HashMap<HidInput, PendingSender<T>>>,
 }
 
 impl<T> Pending<T> {
-    fn new(others: mpsc::Sender<T>) -> Self {
-        Self {
-            others: Arc::new(Mutex::new(others)),
-            pending: Default::default(),
-        }
+    fn new(others: mpsc::Sender<T>) -> Arc<Self> {
+        Arc::new(Self {
+            others: futures::lock::Mutex::new(others),
+            subscribers: Default::default(),
+        })
     }
 
     /// Send some input data with the correct sender.
     ///
     /// Automatically handles dispatching between a specific subscription to
     /// certain inputs or the general event stream.
+    #[instrument(skip(self, data))]
     async fn send_for_input(&self, hid_input: HidInput, data: T) -> Result<(), SnapiError> {
-        let mut pending = self.pending.lock().await;
-        if let Some(tx) = pending.get_mut(&hid_input) {
+        if let Some(tx) = self.subscribers.lock().await.get_mut(&hid_input) {
             let single_use = tx.send(data).await?;
             trace!(single_use, "sent pending request");
         } else {
@@ -293,50 +401,50 @@ impl<T> Pending<T> {
     }
 
     /// Register an input that should only occur once.
-    async fn input_single<'a, F, Fut, O, W>(
+    async fn input_single<F, Fut, Output>(
         &self,
-        device: &'a mut Snapi<W>,
         hid_input: HidInput,
         f: F,
-    ) -> O
+    ) -> Result<Output, SnapiError>
     where
-        F: FnOnce(&'a mut Snapi<W>, oneshot::Receiver<T>) -> Fut,
-        Fut: Future<Output = O>,
+        F: FnOnce(oneshot::Receiver<T>) -> Fut,
+        Fut: Future<Output = Result<Output, SnapiError>>,
     {
+        trace!(?hid_input, "registering single input");
         let (tx, rx) = oneshot::channel();
-        self.pending
+        self.subscribers
             .lock()
             .await
             .insert(hid_input, PendingSender::Single(Some(tx)));
-        let output = f(device, rx).await;
-        self.pending.lock().await.remove(&hid_input);
+        let output = f(rx).await;
+        self.subscribers.lock().await.remove(&hid_input);
         output
     }
 
     /// Register an input that could occur any number of times.
-    async fn input_multi<'a, F, Fut, O, W>(
+    async fn input_multi<F, Fut, Output>(
         &self,
-        device: &'a mut Snapi<W>,
         hid_input: HidInput,
         f: F,
-    ) -> O
+    ) -> Result<Output, SnapiError>
     where
-        F: FnOnce(&'a mut Snapi<W>, mpsc::Receiver<T>) -> Fut,
-        Fut: Future<Output = O>,
+        F: FnOnce(mpsc::Receiver<T>) -> Fut,
+        Fut: Future<Output = Result<Output, SnapiError>>,
     {
+        trace!(?hid_input, "registering multiple input");
         let (tx, rx) = mpsc::channel(0);
-        self.pending
+        self.subscribers
             .lock()
             .await
             .insert(hid_input, PendingSender::Multiple(tx));
-        let output = f(device, rx).await;
-        self.pending.lock().await.remove(&hid_input);
+        let output = f(rx).await;
+        self.subscribers.lock().await.remove(&hid_input);
         output
     }
 }
 
-/// The type of pending sender, either a channel type specifically for single
-/// events or something that can handle many.
+/// The type of pending sender, either a channel type specifically for a single
+/// packet or something that can handle many.
 ///
 /// This is probably an unneeded optimization.
 enum PendingSender<T> {
@@ -375,23 +483,25 @@ impl<T> PendingSender<T> {
     }
 }
 
-/// A reader for SNAPI events.
+/// A reader for SNAPI packets.
 struct SnapiReader {
-    pending: Pending<Vec<u8>>,
+    pending: Arc<Pending<Vec<u8>>>,
 }
 
 impl SnapiReader {
     /// Start a reader by spawning a new task to continuously read input
-    /// reports.
+    /// report packets.
     fn start(
-        events: impl Stream<Item = Vec<u8>> + Send + 'static,
-        pending: Pending<Vec<u8>>,
+        packets: impl Stream<Item = Vec<u8>> + Send + 'static,
+        pending: Arc<Pending<Vec<u8>>>,
         mut shutdown_rx: oneshot::Receiver<()>,
+        reader_ended_tx: oneshot::Sender<()>,
     ) {
         let mut reader = Self { pending };
 
         crate::runtime::spawn(async move {
-            let mut events = Box::pin(events).fuse();
+            let packets = packets.fuse();
+            futures::pin_mut!(packets);
 
             loop {
                 futures::select! {
@@ -400,7 +510,7 @@ impl SnapiReader {
                         break;
                     }
 
-                    res = events.next() => {
+                    res = packets.next() => {
                         match res {
                             Some(buf) => match reader.handle_read(buf).await {
                                 Ok(_) => trace!("handled read"),
@@ -414,16 +524,17 @@ impl SnapiReader {
                     }
                 }
             }
+
+            // Notify for task end if we can.
+            let _ = reader_ended_tx.send(());
         });
     }
 
     /// Handle an incoming HID packet.
-    #[instrument(skip_all, fields(hid_input))]
+    #[instrument(skip_all)]
     async fn handle_read(&mut self, buf: Vec<u8>) -> Result<(), SnapiError> {
         let hid_input = HidInput::from(buf[0]);
-        tracing::Span::current().record("hid_input", format!("{hid_input:?}"));
-
-        trace!("read hid input: {}", hex::encode(&buf));
+        trace!(?hid_input, "read hid input data: {}", hex::encode(&buf));
 
         self.pending.send_for_input(hid_input, buf).await?;
 
