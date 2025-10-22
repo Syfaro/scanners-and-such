@@ -27,12 +27,20 @@ pub struct HidTransportWeb;
 pub struct HidDevice {
     device: web_sys::HidDevice,
     // Hold the reference to the closure until we drop the device.
-    _listener: Closure<dyn FnMut(Event)>,
+    listener: Closure<dyn FnMut(Event)>,
 }
 
 impl Drop for HidDevice {
     fn drop(&mut self) {
+        if let Err(err) = self.device.remove_event_listener_with_callback(
+            "inputreport",
+            self.listener.as_ref().unchecked_ref(),
+        ) {
+            error!("could not remove event listener: {err:?}");
+        }
+
         let device = self.device.clone();
+
         crate::runtime::spawn(async move {
             if let Err(err) = JsFuture::from(device.close()).await {
                 error!("could not close hid device: {err:?}");
@@ -144,7 +152,7 @@ impl OpenableHidDevice for HidDiscoveredDevice {
         Ok((
             HidDevice {
                 device: self.device,
-                _listener: listener,
+                listener,
             },
             rx,
         ))

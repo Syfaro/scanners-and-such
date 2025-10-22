@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Syfaro <syfaro@huefox.com>"]
 
+[workspace]
+members = [".", "web"]
+
 [features]
 default = []
 hid = ["async-hid"]
