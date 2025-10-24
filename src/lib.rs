@@ -17,7 +17,7 @@ pub(crate) mod runtime {
         });
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "snapi"))]
     pub(crate) fn spawn(fut: impl Future<Output = ()> + 'static) {
         wasm_bindgen_futures::spawn_local(fut);
     }

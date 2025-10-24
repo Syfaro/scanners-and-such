@@ -41,7 +41,7 @@ pub fn enable_logging() {}
 
 type SnapiDevice = snapi::Snapi<
     scanners_and_such::transports::hid::HidDefaultDevice,
-    scanners_and_such::transports::usb::UsbDeviceWeb,
+    scanners_and_such::transports::usb::web::UsbDeviceWeb,
 >;
 
 #[wasm_bindgen(js_name = "SnapiDevice")]
@@ -132,7 +132,7 @@ impl SnapiDeviceManager {
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
         if let Some(mut device) = self.device.lock().await.take() {
-            if let Some(mut usb_device) = device.detach_usb_device().await? {
+            if let Some(usb_device) = device.detach_usb_device().await? {
                 self.has_usb_device
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 usb_device.close().await?;
@@ -150,7 +150,7 @@ impl SnapiDeviceManager {
         device: web_sys::UsbDevice,
         callback: js_sys::Function,
     ) -> Result<(), JsError> {
-        let device = scanners_and_such::transports::usb::UsbDeviceWeb::new(device)
+        let device = scanners_and_such::transports::usb::web::UsbDeviceWeb::new(device)
             .await
             .map_err(|_| JsError::new("could not open device"))?;
 

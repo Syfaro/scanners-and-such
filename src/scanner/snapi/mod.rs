@@ -8,7 +8,7 @@ use futures::{
 };
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 
 use crate::{
     scanner::snapi::packet::*,
@@ -543,9 +543,9 @@ impl<H: WritableHidDevice, U: UsbDevice + 'static> Snapi<H, U> {
 
         let (data_tx, data_rx) = mpsc::channel(0);
 
-        for (address, mode) in [(2, SnapiMode::Image), (3, SnapiMode::Video)] {
+        for (address, mode) in [(0x82, SnapiMode::Image), (0x83, SnapiMode::Video)] {
             let mut endpoint = usb_device
-                .claim_bulk_input_endpoint(address)
+                .claim_bulk_input_endpoint(1, address, 4096)
                 .await
                 .map_err(SnapiError::usb)?;
 
@@ -554,84 +554,95 @@ impl<H: WritableHidDevice, U: UsbDevice + 'static> Snapi<H, U> {
 
             let mut data_tx = data_tx.clone();
 
-            crate::runtime::spawn(async move {
-                let mut buf = [0u8; 64];
+            crate::runtime::spawn(
+                async move {
+                    let mut buf = [0u8; 4096];
 
-                // General loop for new USB packets
-                loop {
-                    let mut header = Vec::with_capacity(32);
+                    // General loop for new USB packets
+                    loop {
+                        let mut header = Vec::with_capacity(32);
+                        let mut body = Vec::new();
 
-                    while header.len() < 32 {
-                        trace!("waiting for header data");
-                        // We should only cancel when waiting for headers.
-                        let fut = endpoint.transfer_in(address, &mut buf);
-                        let len = match futures::future::select(&mut cancel_rx, fut).await {
-                            Either::Left((tx, _)) => {
-                                info!("usb task cancelled");
-                                if let Ok(tx) = tx {
-                                    let _ = tx.send(());
+                        while header.len() < 32 {
+                            trace!("waiting for header data");
+                            // We should only cancel when waiting for headers.
+                            let fut = endpoint.transfer_in(&mut buf);
+                            let len = match futures::future::select(&mut cancel_rx, fut).await {
+                                Either::Left((tx, _)) => {
+                                    info!("usb task cancelled");
+                                    if let Ok(tx) = tx {
+                                        let _ = tx.send(());
+                                    }
+                                    return;
                                 }
-                                return;
+                                Either::Right((res, _)) => match res {
+                                    Ok(len) => len,
+                                    Err(err) => {
+                                        error!("usb error: {err:?}");
+                                        return;
+                                    }
+                                },
+                            };
+
+                            let header_bytes = std::cmp::min(len, 32 - header.len());
+                            header.extend_from_slice(&buf[..header_bytes]);
+
+                            trace!(
+                                packet_len = len,
+                                header_len = header.len(),
+                                "updated usb header information: {}",
+                                hex::encode(&header)
+                            );
+
+                            if len > header_bytes {
+                                trace!(
+                                    additional_len = len - header_bytes,
+                                    "adding additional bytes to body"
+                                );
+                                body.extend_from_slice(&buf[header_bytes..]);
                             }
-                            Either::Right((res, _)) => match res {
+                        }
+
+                        let total_len: usize =
+                            u32::from_le_bytes([header[0], header[1], header[2], header[3]])
+                                .try_into()
+                                .expect("u32 should always fit into usize");
+                        debug!("expecting {total_len} bytes");
+                        body.reserve_exact(total_len - body.len());
+
+                        loop {
+                            let len = match endpoint.transfer_in(&mut buf).await {
                                 Ok(len) => len,
                                 Err(err) => {
                                     error!("usb error: {err:?}");
                                     return;
                                 }
-                            },
-                        };
-                        header.extend_from_slice(&buf[..std::cmp::min(len, 32 - header.len())]);
-                        trace!(
-                            packet_len = len,
-                            header_len = header.len(),
-                            "updated usb header information: {}",
-                            hex::encode(&header)
-                        );
-                    }
+                            };
+                            body.extend_from_slice(&buf[..len]);
+                            debug!(
+                                len,
+                                total_len,
+                                body_len = body.len(),
+                                finished = body.len() == total_len,
+                                "read more bytes"
+                            );
 
-                    let total_len: usize =
-                        u32::from_le_bytes([header[0], header[1], header[2], header[3]])
-                            .try_into()
-                            .expect("u32 should always fit into usize");
-                    debug!("expecting {total_len} bytes");
-
-                    let mut body = Vec::with_capacity(total_len);
-
-                    // Loop for a specific packet. We need to handle the first
-                    // packet a bit differently, as it contains the header
-                    // information and not image data.
-                    loop {
-                        let len = match endpoint.transfer_in(address, &mut buf).await {
-                            Ok(len) => len,
-                            Err(err) => {
-                                error!("usb error: {err:?}");
-                                return;
+                            if body.len() == total_len {
+                                break;
                             }
-                        };
-                        body.extend_from_slice(&buf[..len]);
-                        debug!(
-                            len,
-                            total_len,
-                            body_len = body.len(),
-                            finished = body.len() == total_len,
-                            "read more bytes"
-                        );
+                        }
 
-                        if body.len() == total_len {
-                            break;
+                        if data_tx
+                            .send(Ok(SnapiData { mode, header, body }))
+                            .await
+                            .is_err()
+                        {
+                            error!("could not send snapi data");
                         }
                     }
-
-                    if data_tx
-                        .send(Ok(SnapiData { mode, header, body }))
-                        .await
-                        .is_err()
-                    {
-                        error!("could not send snapi data");
-                    }
                 }
-            });
+                .instrument(tracing::info_span!("usb_poll_loop", address)),
+            );
         }
 
         self.usb = Some((usb_device, data_tx));
