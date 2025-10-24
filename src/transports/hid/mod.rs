@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use futures::Stream;
-use serde::Serialize;
+
+use crate::transports::UsbFilter;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
@@ -35,13 +36,6 @@ pub type HidDefaultDevice = native::HidDevice;
 pub type HidDefaultTransport = web::HidTransportWeb;
 #[cfg(target_arch = "wasm32")]
 pub type HidDefaultDevice = web::HidDevice;
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsbFilter {
-    pub vendor_id: u16,
-    pub product_id: u16,
-}
 
 #[async_trait(?Send)]
 pub trait HidTransport {

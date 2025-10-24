@@ -23,6 +23,18 @@ pub struct HidDevice {
     wtr: async_hid::DeviceWriter,
 }
 
+impl From<async_hid::Device> for HidDiscoveredDevice {
+    fn from(value: async_hid::Device) -> Self {
+        Self { device: value }
+    }
+}
+
+impl HidDiscoveredDevice {
+    pub fn into_inner(self) -> async_hid::Device {
+        self.device
+    }
+}
+
 #[async_trait(?Send)]
 impl HidTransport for HidTransportNative {
     async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<HidDiscoveredDevice>, HidError> {

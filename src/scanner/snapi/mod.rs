@@ -3,14 +3,19 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use futures::{
     SinkExt, Stream, StreamExt,
     channel::{mpsc, oneshot},
+    future::Either,
+    lock::Mutex,
 };
 use num_enum::{FromPrimitive, IntoPrimitive};
-use serde::Serialize;
-use tracing::{debug, error, instrument, trace, warn};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::{
     scanner::snapi::packet::*,
-    transports::hid::{ClosableHidDevice, HidError, WritableHidDevice},
+    transports::{
+        hid::{ClosableHidDevice, HidError, WritableHidDevice},
+        usb::{UsbDevice, UsbDeviceTransportInput},
+    },
 };
 
 pub mod code_types;
@@ -19,28 +24,84 @@ pub mod packet;
 pub const USB_VENDOR_ID: u16 = 0x05E0;
 pub const USB_PRODUCT_ID: u16 = 0x1900;
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
 #[repr(u8)]
 pub enum HidInput {
     Status = 0x21,
     Barcode = 0x22,
+    Notification = 0x24,
     Attribute = 0x27,
     #[num_enum(catch_all)]
     Unknown(u8),
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive, Serialize)]
-#[serde(rename_all = "camelCase")]
+impl serde::Serialize for HidInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8((*self).into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
 #[repr(u8)]
 pub enum HidOutput {
     Acknowledgement = 0x01,
     Aim = 0x02,
+    Mode = 0x03,
     Scanner = 0x06,
     MacroPdf = 0x08,
+    SoftTrigger = 0x0A,
     Attribute = 0x0D,
     #[num_enum(catch_all)]
     Unknown(u8),
+}
+
+impl serde::Serialize for HidOutput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8((*self).into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
+#[repr(u8)]
+pub enum SnapiNotification {
+    BarcodeMode = 0x10,
+    ImageMode = 0x11,
+    VideoMode = 0x12,
+    #[num_enum(catch_all)]
+    Unknown(u8),
+}
+
+impl DecodableSnapiPacket for SnapiNotification {
+    const HID_INPUT: HidInput = HidInput::Notification;
+
+    fn decode(data: &[u8]) -> Result<Self, SnapiError> {
+        Ok(SnapiNotification::from(data[1]))
+    }
+
+    fn packet(self) -> SnapiPacket {
+        SnapiPacket::Notification(self)
+    }
+}
+
+impl SnapiPacketOutput for SnapiNotification {
+    fn output(self) -> Option<SnapiOutput> {
+        Some(SnapiOutput::Notification(self))
+    }
+}
+
+impl serde::Serialize for SnapiNotification {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8((*self).into())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -55,11 +116,29 @@ pub enum SnapiError {
     Channel { name: &'static str },
     #[error("packets were missing or out of order: {name}")]
     BadPacketOrder { name: Cow<'static, str> },
+    #[error("mismatched data type: {name}")]
+    MismatchedData { name: &'static str },
+    #[error("usb error: {message}")]
+    Usb { message: String },
+}
+
+impl SnapiError {
+    fn usb(err: impl std::fmt::Debug) -> Self {
+        Self::Usb {
+            message: format!("{err:?}"),
+        }
+    }
+}
+
+pub struct SnapiData {
+    pub mode: SnapiMode,
+    pub header: Vec<u8>,
+    pub body: Vec<u8>,
 }
 
 /// A SNAPI device.
-pub struct Snapi<W> {
-    wtr: W,
+pub struct Snapi<H, U = ()> {
+    hid_device: H,
     is_connected: bool,
 
     pending: Arc<Pending<Vec<u8>>>,
@@ -68,6 +147,24 @@ pub struct Snapi<W> {
 
     barcode_packets: Vec<SnapiBarcodePacket>,
     attribute_packets: Vec<SnapiAttributePacket>,
+
+    usb: Option<(U, mpsc::Sender<Result<SnapiData, SnapiError>>)>,
+    cancel_usb_tasks: HashMap<u8, oneshot::Sender<oneshot::Sender<()>>>,
+}
+
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
+#[cfg_attr(feature = "web", tsify(into_wasm_abi, from_wasm_abi))]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive, FromPrimitive, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum SnapiMode {
+    Barcode = 0x00,
+    Image = 0x01,
+    Video = 0x02,
+    #[num_enum(catch_all)]
+    Unknown(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive)]
@@ -77,10 +174,10 @@ pub enum MacroPdfAction {
     Abort = 0x01,
 }
 
-impl<W: WritableHidDevice> Snapi<W> {
+impl<H: WritableHidDevice, U> Snapi<H, U> {
     /// Create a new SNAPI device from a HID device and initialize it.
     pub async fn new(
-        wtr: W,
+        hid: H,
         packets: impl Stream<Item = Vec<u8>> + Send + 'static,
     ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SnapiError> {
         let (others_tx, others_rx) = mpsc::channel(8);
@@ -90,7 +187,7 @@ impl<W: WritableHidDevice> Snapi<W> {
         let (reader_ended_tx, reader_ended_rx) = oneshot::channel();
 
         let mut snapi_device = Self {
-            wtr,
+            hid_device: hid,
             is_connected: true,
 
             pending: Arc::clone(&pending),
@@ -99,6 +196,9 @@ impl<W: WritableHidDevice> Snapi<W> {
 
             barcode_packets: Vec::new(),
             attribute_packets: Vec::new(),
+
+            usb: None,
+            cancel_usb_tasks: HashMap::new(),
         };
 
         // Spawn reader after creating device, because now device will send a
@@ -120,6 +220,16 @@ impl<W: WritableHidDevice> Snapi<W> {
             HidOutput::Acknowledgement,
             &mut [HidOutput::Acknowledgement.into(), input.into(), 0x01],
             false,
+        )
+        .await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn set_mode(&mut self, mode: SnapiMode) -> Result<(), SnapiError> {
+        self.write_command(
+            HidOutput::Mode,
+            &mut [HidOutput::Mode.into(), mode.into()],
+            true,
         )
         .await
     }
@@ -159,6 +269,107 @@ impl<W: WritableHidDevice> Snapi<W> {
         .await
     }
 
+    #[instrument(skip(self))]
+    pub async fn set_soft_trigger(&mut self, enabled: bool) -> Result<(), SnapiError> {
+        self.write_command(
+            HidOutput::SoftTrigger,
+            &mut [HidOutput::SoftTrigger.into(), enabled as u8],
+            true,
+        )
+        .await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn get_attribute_ids(&mut self, offset: u16) -> Result<Vec<u16>, SnapiError> {
+        let offset_bytes = offset.to_be_bytes();
+        let command = [0x00, 0x06, 0x01, 0x00, offset_bytes[0], offset_bytes[1]];
+
+        match self.write_attribute_command(&command).await? {
+            SnapiAttributeResponse::GetId(ids) => Ok(ids),
+            _ => Err(SnapiError::MismatchedData {
+                name: "attribute ids",
+            }),
+        }
+    }
+
+    #[instrument(skip(self))]
+    pub async fn get_all_attribute_ids(&mut self) -> Result<Vec<u16>, SnapiError> {
+        let mut all_ids = Vec::new();
+
+        let mut offset = 0;
+
+        loop {
+            let mut ids = self.get_attribute_ids(offset).await?;
+
+            let Some(id) = ids.last().copied() else {
+                break;
+            };
+
+            let is_last = id == 0xFFFF;
+            if is_last {
+                ids.pop();
+            }
+            all_ids.extend_from_slice(&ids);
+            if is_last {
+                break;
+            }
+
+            offset = id + 1;
+        }
+
+        Ok(all_ids)
+    }
+
+    /// Get the value of an attribute by ID.
+    #[instrument(skip(self))]
+    pub async fn get_attribute(
+        &mut self,
+        attribute_id: u16,
+    ) -> Result<Option<SnapiAttributeValue>, SnapiError> {
+        let id_bytes = attribute_id.to_be_bytes();
+        let command = [0x00, 0x06, 0x02, 0x00, id_bytes[0], id_bytes[1]];
+
+        match self.write_attribute_command(&command).await? {
+            SnapiAttributeResponse::Get(value) => Ok(value),
+            _ => Err(SnapiError::MismatchedData {
+                name: "attribute get",
+            }),
+        }
+    }
+
+    #[instrument(skip(self, value))]
+    pub async fn set_attribute(
+        &mut self,
+        attribute_id: u16,
+        store: bool,
+        value: SnapiAttributeValue,
+    ) -> Result<(), SnapiError> {
+        let data = value.encode().ok_or_else(|| SnapiError::MismatchedData {
+            name: "cannot encode unknown value",
+        })?;
+
+        let len = data.len() + 6;
+
+        let mut command = Vec::with_capacity(len);
+        command.extend_from_slice(
+            &u16::try_from(len)
+                .expect("len must fit in u16")
+                .to_be_bytes(),
+        );
+        command.push(if store { 0x06 } else { 0x05 });
+        command.push(0x00);
+        command.extend_from_slice(&attribute_id.to_be_bytes());
+        command.extend_from_slice(&data);
+
+        match self.write_attribute_command(&command).await? {
+            SnapiAttributeResponse::Store if store => Ok(()),
+            SnapiAttributeResponse::Set if !store => Ok(()),
+            _ => Err(SnapiError::MismatchedData {
+                name: "attribute set",
+            }),
+        }
+    }
+
     /// Perform a simple command that produces no return value, and optionally
     /// checks the status.
     #[instrument(skip(self, packet))]
@@ -179,7 +390,7 @@ impl<W: WritableHidDevice> Snapi<W> {
         if read_status {
             Arc::clone(&self.pending)
                 .input_single(HidInput::Status, async move |mut rx| {
-                    self.wtr.write_report(packet).await?;
+                    self.hid_device.write_report(packet).await?;
 
                     trace!("reading status");
                     self.read_status(&mut rx)
@@ -190,67 +401,18 @@ impl<W: WritableHidDevice> Snapi<W> {
                 })
                 .await?;
         } else {
-            self.wtr.write_report(packet).await?;
+            self.hid_device.write_report(packet).await?;
         }
 
         Ok(())
     }
 
-    /// Get the value of an attribute by ID.
-    #[instrument(skip(self))]
-    pub async fn get_attribute(
-        &mut self,
-        attribute_id: u16,
-    ) -> Result<Option<SnapiAttributeValue>, SnapiError> {
-        let mut command = Vec::with_capacity(6);
-        command.extend_from_slice(&[0x00, 0x06, 0x02, 0x00]);
-        command.extend_from_slice(&attribute_id.to_be_bytes());
-
-        let value = self.write_attribute_command(&command).await?;
-
-        Ok(value)
-    }
-
-    /// Read a single status packet.
-    #[instrument(skip(self))]
-    async fn read_status(
-        &mut self,
-        rx: &mut oneshot::Receiver<Vec<u8>>,
-    ) -> Result<SnapiStatus, SnapiError> {
-        let buf = rx
-            .await
-            .map_err(|_| SnapiError::Channel { name: "rx status" })?;
-
-        SnapiPacket::decode_specific(&buf)
-    }
-
-    /// Initialize the device.
-    ///
-    /// There are a couple of magic commands that must be run before the device
-    /// will start talking to us.
-    #[instrument(skip(self))]
-    async fn initialize_device(&mut self) -> Result<(), SnapiError> {
-        static COMMANDS: [[u8; 9]; 2] = [
-            [0x00, 0x06, 0x20, 0x00, 0x04, 0xB0, 0x00, 0x00, 0x00],
-            [0x00, 0x09, 0x05, 0x00, 0x4E, 0x2A, 0x42, 0x00, 0x01],
-        ];
-
-        debug!("initializing device");
-        for command in COMMANDS {
-            self.write_attribute_command(&command).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Encodes an attribute command into as many packets are as needed and send
-    /// them all.
     #[instrument(skip_all)]
     async fn write_attribute_command(
         &mut self,
         command: &[u8],
-    ) -> Result<Option<SnapiAttributeValue>, SnapiError> {
-        let value = Arc::clone(&self.pending)
+    ) -> Result<SnapiAttributeResponse, SnapiError> {
+        let response = Arc::clone(&self.pending)
             .input_multi(HidInput::Attribute, async move |mut rx| {
                 for mut packet in encode_attribute_request(command) {
                     self.write_command(HidOutput::Attribute, &mut packet, true)
@@ -282,10 +444,35 @@ impl<W: WritableHidDevice> Snapi<W> {
                 Ok(value)
             })
             .await?;
+        trace!("got attribute response: {response:?}");
 
-        trace!("got attribute value: {value:?}");
+        Ok(response)
+    }
 
-        Ok(value)
+    /// Read a single status packet.
+    #[instrument(skip(self))]
+    async fn read_status(
+        &mut self,
+        rx: &mut oneshot::Receiver<Vec<u8>>,
+    ) -> Result<SnapiStatus, SnapiError> {
+        let buf = rx
+            .await
+            .map_err(|_| SnapiError::Channel { name: "rx status" })?;
+
+        SnapiPacket::decode_specific(&buf)
+    }
+
+    /// Initialize the device.
+    ///
+    /// There are a couple of magic commands that must be run before the device
+    /// will start talking to us.
+    #[instrument(skip(self))]
+    async fn initialize_device(&mut self) -> Result<(), SnapiError> {
+        debug!("initializing device");
+        self.write_attribute_command(&[0x00, 0x06, 0x20, 0x00, 0x04, 0xB0])
+            .await?;
+
+        Ok(())
     }
 
     /// Attempt to process a packet by collating all packets into an output.
@@ -311,6 +498,7 @@ impl<W: WritableHidDevice> Snapi<W> {
         let output = match packet {
             SnapiPacket::Status(status) => status.output(),
             SnapiPacket::Barcode(packet) => packet.collate(&mut self.barcode_packets)?.output(),
+            SnapiPacket::Notification(notification) => notification.output(),
             SnapiPacket::Attribute(packet) => packet.collate(&mut self.attribute_packets)?.output(),
             SnapiPacket::Other { hid_input, data } => Some(SnapiOutput::Other { hid_input, data }),
         };
@@ -320,7 +508,7 @@ impl<W: WritableHidDevice> Snapi<W> {
     }
 }
 
-impl<W: ClosableHidDevice> Snapi<W> {
+impl<H: ClosableHidDevice, U> Snapi<H, U> {
     pub async fn close(mut self) -> Result<(), SnapiError> {
         self.is_connected = false;
 
@@ -332,13 +520,139 @@ impl<W: ClosableHidDevice> Snapi<W> {
             })?;
         }
 
-        self.wtr.close().await?;
+        self.hid_device.close().await?;
 
         Ok(())
     }
 }
 
-impl<W> Snapi<W> {
+impl<H: WritableHidDevice, U: UsbDevice + 'static> Snapi<H, U> {
+    pub async fn attach_usb_device(
+        &mut self,
+        mut usb_device: U,
+    ) -> Result<mpsc::Receiver<Result<SnapiData, SnapiError>>, SnapiError> {
+        usb_device
+            .select_configuration(1)
+            .await
+            .map_err(SnapiError::usb)?;
+
+        usb_device
+            .claim_interface(1)
+            .await
+            .map_err(SnapiError::usb)?;
+
+        let (data_tx, data_rx) = mpsc::channel(0);
+
+        for (address, mode) in [(2, SnapiMode::Image), (3, SnapiMode::Video)] {
+            let mut endpoint = usb_device
+                .claim_bulk_input_endpoint(address)
+                .await
+                .map_err(SnapiError::usb)?;
+
+            let (cancel_tx, mut cancel_rx) = oneshot::channel();
+            self.cancel_usb_tasks.insert(address, cancel_tx);
+
+            let mut data_tx = data_tx.clone();
+
+            crate::runtime::spawn(async move {
+                let mut buf = [0u8; 64];
+
+                // General loop for new USB packets
+                loop {
+                    let mut header = Vec::with_capacity(32);
+
+                    while header.len() < 32 {
+                        trace!("waiting for header data");
+                        // We should only cancel when waiting for headers.
+                        let fut = endpoint.transfer_in(address, &mut buf);
+                        let len = match futures::future::select(&mut cancel_rx, fut).await {
+                            Either::Left((tx, _)) => {
+                                info!("usb task cancelled");
+                                if let Ok(tx) = tx {
+                                    let _ = tx.send(());
+                                }
+                                return;
+                            }
+                            Either::Right((res, _)) => match res {
+                                Ok(len) => len,
+                                Err(err) => {
+                                    error!("usb error: {err:?}");
+                                    return;
+                                }
+                            },
+                        };
+                        header.extend_from_slice(&buf[..std::cmp::min(len, 32 - header.len())]);
+                        trace!(
+                            packet_len = len,
+                            header_len = header.len(),
+                            "updated usb header information: {}",
+                            hex::encode(&header)
+                        );
+                    }
+
+                    let total_len: usize =
+                        u32::from_le_bytes([header[0], header[1], header[2], header[3]])
+                            .try_into()
+                            .expect("u32 should always fit into usize");
+                    debug!("expecting {total_len} bytes");
+
+                    let mut body = Vec::with_capacity(total_len);
+
+                    // Loop for a specific packet. We need to handle the first
+                    // packet a bit differently, as it contains the header
+                    // information and not image data.
+                    loop {
+                        let len = match endpoint.transfer_in(address, &mut buf).await {
+                            Ok(len) => len,
+                            Err(err) => {
+                                error!("usb error: {err:?}");
+                                return;
+                            }
+                        };
+                        body.extend_from_slice(&buf[..len]);
+                        debug!(
+                            len,
+                            total_len,
+                            body_len = body.len(),
+                            finished = body.len() == total_len,
+                            "read more bytes"
+                        );
+
+                        if body.len() == total_len {
+                            break;
+                        }
+                    }
+
+                    if data_tx
+                        .send(Ok(SnapiData { mode, header, body }))
+                        .await
+                        .is_err()
+                    {
+                        error!("could not send snapi data");
+                    }
+                }
+            });
+        }
+
+        self.usb = Some((usb_device, data_tx));
+
+        Ok(data_rx)
+    }
+
+    pub async fn detach_usb_device(&mut self) -> Result<Option<U>, SnapiError> {
+        for (_, cancel_tx) in std::mem::take(&mut self.cancel_usb_tasks) {
+            let (tx, rx) = oneshot::channel();
+
+            if cancel_tx.send(tx).is_ok() {
+                let _ = rx.await;
+            }
+        }
+
+        Ok(self.usb.take().map(|usb| usb.0))
+    }
+}
+
+impl<H, U> Snapi<H, U> {
     fn shutdown(&mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             debug!("shutting down snapi device");
@@ -348,7 +662,7 @@ impl<W> Snapi<W> {
     }
 }
 
-impl<W> Drop for Snapi<W> {
+impl<H, U> Drop for Snapi<H, U> {
     fn drop(&mut self) {
         self.shutdown();
 
@@ -365,15 +679,15 @@ impl<W> Drop for Snapi<W> {
 /// registering the expected output with a channel for processing.
 struct Pending<T> {
     /// The general event stream for non-reserved packets.
-    others: futures::lock::Mutex<mpsc::Sender<T>>,
+    others: Mutex<mpsc::Sender<T>>,
     /// A collection of subscribers for specific HID inputs.
-    subscribers: futures::lock::Mutex<HashMap<HidInput, PendingSender<T>>>,
+    subscribers: Mutex<HashMap<HidInput, PendingSender<T>>>,
 }
 
 impl<T> Pending<T> {
     fn new(others: mpsc::Sender<T>) -> Arc<Self> {
         Arc::new(Self {
-            others: futures::lock::Mutex::new(others),
+            others: Mutex::new(others),
             subscribers: Default::default(),
         })
     }

@@ -1,18 +1,26 @@
-use std::sync::{Arc, atomic::AtomicBool};
+#![cfg(target_arch = "wasm32")]
+
+use std::{rc::Rc, sync::atomic::AtomicBool};
 
 use futures::{StreamExt, lock::Mutex};
 use scanners_and_such::{
     scanner::snapi,
-    transports::hid::{HidTransport, OpenableHidDevice, UsbFilter},
+    transports::{
+        hid::{HidDiscoveredDevice, OpenableHidDevice},
+        usb::UsbDevice,
+    },
 };
 use tracing::{debug, error};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tracing_web::{MakeWebConsoleWriter, performance_layer};
 use wasm_bindgen::{JsError, JsValue, prelude::wasm_bindgen};
 use wasm_bindgen_futures::js_sys;
+use web_sys::js_sys::Uint8Array;
 
+#[cfg(feature = "logging")]
 #[wasm_bindgen(js_name = "enableLogging")]
 pub fn enable_logging() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_web::{MakeWebConsoleWriter, performance_layer};
+
     console_error_panic_hook::set_once();
 
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -27,51 +35,60 @@ pub fn enable_logging() {
         .init();
 }
 
-type SnapiDevice = snapi::Snapi<scanners_and_such::transports::hid::HidDefaultDevice>;
+#[cfg(not(feature = "logging"))]
+#[wasm_bindgen(js_name = "enableLogging")]
+pub fn enable_logging() {}
 
-#[wasm_bindgen]
+type SnapiDevice = snapi::Snapi<
+    scanners_and_such::transports::hid::HidDefaultDevice,
+    scanners_and_such::transports::usb::UsbDeviceWeb,
+>;
+
+#[wasm_bindgen(js_name = "SnapiDevice")]
+#[derive(Default)]
 pub struct SnapiDeviceManager {
-    device: Arc<Mutex<Option<SnapiDevice>>>,
-    is_running: Arc<AtomicBool>,
+    device: Rc<Mutex<Option<SnapiDevice>>>,
+
+    is_running: Rc<AtomicBool>,
+    has_usb_device: Rc<AtomicBool>,
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen(js_class = "SnapiDevice")]
 impl SnapiDeviceManager {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self {
-            device: Arc::new(Mutex::new(None)),
-            is_running: Default::default(),
-        }
+        Self::default()
     }
 
-    #[wasm_bindgen]
+    #[wasm_bindgen(return_description = "if a device is currently connected")]
     pub async fn connected(&self) -> bool {
         self.device.lock().await.is_some()
     }
 
-    #[wasm_bindgen]
-    pub async fn start(&self, f: js_sys::Function) -> Result<(), JsError> {
-        let mut devices =
-            scanners_and_such::transports::hid::HidDefaultTransport::get_devices(&[UsbFilter {
-                vendor_id: snapi::USB_VENDOR_ID,
-                product_id: snapi::USB_PRODUCT_ID,
-            }])
+    #[wasm_bindgen(return_description = "if a USB device is attached")]
+    pub async fn usb_device_attached(&self) -> bool {
+        self.has_usb_device
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[wasm_bindgen(js_name = "start")]
+    pub async fn start(
+        &self,
+        #[wasm_bindgen(param_description = "HID device to use")] device: web_sys::HidDevice,
+        #[wasm_bindgen(param_description = "callback to be executed on every complete output")]
+        callback: js_sys::Function,
+    ) -> Result<(), JsError> {
+        let (device, packets) = HidDiscoveredDevice::from(device)
+            .open::<{ snapi::packet::PACKET_LEN }>()
             .await?;
-
-        let Some(device) = devices.pop() else {
-            return Err(JsError::new("no devices found"));
-        };
-
-        let (device, packets) = device.open::<{ snapi::packet::PACKET_LEN }>().await?;
         let (device, mut packets) = snapi::Snapi::new(device, packets).await?;
 
         *self.device.lock().await = Some(device);
         self.is_running
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let is_running = Arc::clone(&self.is_running);
-        let device = Arc::clone(&self.device);
+        let is_running = Rc::clone(&self.is_running);
+        let device = Rc::clone(&self.device);
 
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(packet) = packets.next().await {
@@ -91,14 +108,10 @@ impl SnapiDeviceManager {
                     }
                 };
 
-                let value = serde_wasm_bindgen::to_value(&value).unwrap();
+                let value = serde_wasm_bindgen::to_value(&value)
+                    .expect("it should always be possible to serialize SnapiOutput");
 
-                if !f.is_function() {
-                    error!("f isn't valid function");
-                    break;
-                }
-
-                if let Err(err) = f.call1(&JsValue::null(), &value) {
+                if let Err(err) = callback.call1(&JsValue::null(), &value) {
                     error!("could not call provided function: {err:?}");
                 }
             }
@@ -118,16 +131,79 @@ impl SnapiDeviceManager {
         self.is_running
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let device = self.device.lock().await.take();
-        if let Some(device) = device {
+        if let Some(mut device) = self.device.lock().await.take() {
+            if let Some(mut usb_device) = device.detach_usb_device().await? {
+                self.has_usb_device
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                usb_device.close().await?;
+            };
+
             device.close().await?;
         }
 
         Ok(())
     }
 
+    #[wasm_bindgen(js_name = "attachUsbDevice")]
+    pub async fn attach_usb_device(
+        &self,
+        device: web_sys::UsbDevice,
+        callback: js_sys::Function,
+    ) -> Result<(), JsError> {
+        let device = scanners_and_such::transports::usb::UsbDeviceWeb::new(device)
+            .await
+            .map_err(|_| JsError::new("could not open device"))?;
+
+        let mut rx = self
+            .device
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| JsError::new("device not yet started"))?
+            .attach_usb_device(device)
+            .await
+            .map_err(|err| JsError::new(&format!("could not attach device: {err:?}")))?;
+
+        self.has_usb_device
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(data) = rx.next().await {
+                let (err, value) = match data {
+                    Ok(data) => (
+                        JsValue::null(),
+                        Uint8Array::new_from_slice(&data.body).into(),
+                    ),
+                    Err(err) => (JsError::new(&err.to_string()).into(), JsValue::null()),
+                };
+
+                if let Err(err) = callback.call2(&JsValue::null(), &err, &value) {
+                    error!("could not call provided function: {err:?}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = "setMode")]
+    pub async fn set_mode(&self, mode: snapi::SnapiMode) -> Result<(), JsError> {
+        self.device
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| JsError::new("device not yet started"))?
+            .set_mode(mode)
+            .await?;
+
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = "setAim")]
-    pub async fn set_aim(&self, enabled: bool) -> Result<(), JsError> {
+    pub async fn set_aim(
+        &self,
+        #[wasm_bindgen(param_description = "if the aiming dot shoult be enabled")] enabled: bool,
+    ) -> Result<(), JsError> {
         self.device
             .lock()
             .await
@@ -140,7 +216,10 @@ impl SnapiDeviceManager {
     }
 
     #[wasm_bindgen(js_name = "setScanner")]
-    pub async fn set_scanner(&self, enabled: bool) -> Result<(), JsError> {
+    pub async fn set_scanner(
+        &self,
+        #[wasm_bindgen(param_description = "if the scanner shoult be enabled")] enabled: bool,
+    ) -> Result<(), JsError> {
         self.device
             .lock()
             .await
@@ -152,8 +231,46 @@ impl SnapiDeviceManager {
         Ok(())
     }
 
-    #[wasm_bindgen(js_name = "getAttribute")]
-    pub async fn get_attribute(&self, attribute_id: u16) -> Result<JsValue, JsError> {
+    #[wasm_bindgen(js_name = "setSoftTrigger")]
+    pub async fn set_soft_trigger(
+        &self,
+        #[wasm_bindgen(param_description = "if the the trigger should be pulled")] enabled: bool,
+    ) -> Result<(), JsError> {
+        self.device
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| JsError::new("device not yet started"))?
+            .set_soft_trigger(enabled)
+            .await?;
+
+        Ok(())
+    }
+
+    #[wasm_bindgen(
+        js_name = "getAttributeIds",
+        return_description = "all known attribute IDs"
+    )]
+    pub async fn get_attribute_ids(&self) -> Result<Vec<u16>, JsError> {
+        self.device
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| JsError::new("device not yet started"))?
+            .get_all_attribute_ids()
+            .await
+            .map_err(Into::into)
+    }
+
+    #[wasm_bindgen(
+        js_name = "getAttribute",
+        return_description = "the type and value of the attribute, if it exists"
+    )]
+    pub async fn get_attribute(
+        &self,
+        #[wasm_bindgen(js_name = "attributeId", param_description = "the attribute ID")]
+        attribute_id: u16,
+    ) -> Result<Option<snapi::packet::SnapiAttributeValue>, JsError> {
         let value = self
             .device
             .lock()
@@ -163,8 +280,26 @@ impl SnapiDeviceManager {
             .get_attribute(attribute_id)
             .await?;
 
-        let value = serde_wasm_bindgen::to_value(&value)?;
-
         Ok(value)
+    }
+
+    #[wasm_bindgen(js_name = "setAttribute")]
+    pub async fn set_attribute(
+        &self,
+        #[wasm_bindgen(js_name = "attributeId", param_description = "the attribute ID")]
+        attribute_id: u16,
+        #[wasm_bindgen(param_description = "if the value should be persisted")] store: bool,
+        #[wasm_bindgen(param_description = "the type and value to store to the attribute")]
+        value: snapi::packet::SnapiAttributeValue,
+    ) -> Result<(), JsError> {
+        self.device
+            .lock()
+            .await
+            .as_mut()
+            .ok_or_else(|| JsError::new("device not yet started"))?
+            .set_attribute(attribute_id, store, value)
+            .await?;
+
+        Ok(())
     }
 }

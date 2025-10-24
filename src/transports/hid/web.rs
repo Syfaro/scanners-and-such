@@ -30,6 +30,18 @@ pub struct HidDevice {
     listener: Closure<dyn FnMut(Event)>,
 }
 
+impl From<web_sys::HidDevice> for HidDiscoveredDevice {
+    fn from(value: web_sys::HidDevice) -> Self {
+        Self { device: value }
+    }
+}
+
+impl HidDiscoveredDevice {
+    pub fn into_inner(self) -> web_sys::HidDevice {
+        self.device
+    }
+}
+
 impl Drop for HidDevice {
     fn drop(&mut self) {
         if let Err(err) = self.device.remove_event_listener_with_callback(
@@ -49,13 +61,8 @@ impl Drop for HidDevice {
     }
 }
 
-#[async_trait(?Send)]
-impl HidTransport for HidTransportWeb {
-    async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<HidDiscoveredDevice>, HidError> {
-        let filters = serde_wasm_bindgen::to_value(filters)
-            .map_err(|err| HidError::new("failed to serialize filters", Some(err.into())))?;
-        let request_opts = HidDeviceRequestOptions::new(&filters);
-
+impl HidTransportWeb {
+    fn get_hid() -> Result<web_sys::Hid, HidError> {
         let window =
             web_sys::window().ok_or_else(|| HidError::new("missing window object", None))?;
         let navigator = window.navigator();
@@ -66,13 +73,11 @@ impl HidTransport for HidTransportWeb {
             return Err(HidError::new("navigator was missing hid object", None));
         }
 
-        let hid = navigator.hid();
+        Ok(navigator.hid())
+    }
 
-        let devices = JsFuture::from(hid.request_device(&request_opts))
-            .await
-            .map_err(|err| HidError::new("request device call failed", Some(err)))?;
-
-        let devices: Vec<_> = devices
+    fn extract_devices(value: JsValue) -> Result<Vec<HidDiscoveredDevice>, HidError> {
+        value
             .dyn_into::<Array>()
             .map_err(|err| HidError::new("hid devices were not array", Some(err)))?
             .into_iter()
@@ -82,9 +87,24 @@ impl HidTransport for HidTransportWeb {
                     .map(|device| HidDiscoveredDevice { device })
             })
             .collect::<Result<_, _>>()
-            .map_err(|err| HidError::new("returned object was not hid device", Some(err)))?;
+            .map_err(|err| HidError::new("returned object was not hid device", Some(err)))
+    }
+}
 
-        Ok(devices)
+#[async_trait(?Send)]
+impl HidTransport for HidTransportWeb {
+    async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<HidDiscoveredDevice>, HidError> {
+        let filters = serde_wasm_bindgen::to_value(filters)
+            .map_err(|err| HidError::new("failed to serialize filters", Some(err.into())))?;
+        let request_opts = HidDeviceRequestOptions::new(&filters);
+
+        let hid = Self::get_hid()?;
+
+        let devices = JsFuture::from(hid.request_device(&request_opts))
+            .await
+            .map_err(|err| HidError::new("request device call failed", Some(err)))?;
+
+        Self::extract_devices(devices)
     }
 }
 

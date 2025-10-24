@@ -2,7 +2,7 @@ pub mod scanner;
 pub mod transports;
 
 pub(crate) mod runtime {
-    #[cfg(feature = "runtime-smol")]
+    #[cfg(all(feature = "runtime-smol", not(target_arch = "wasm32")))]
     pub(crate) fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
         smol::spawn(async move {
             fut.await;
@@ -10,7 +10,7 @@ pub(crate) mod runtime {
         .detach();
     }
 
-    #[cfg(feature = "runtime-tokio")]
+    #[cfg(all(feature = "runtime-tokio", not(target_arch = "wasm32")))]
     pub(crate) fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
         tokio::spawn(async move {
             fut.await;

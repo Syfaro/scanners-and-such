@@ -9,10 +9,16 @@ members = [".", "web"]
 
 [features]
 default = []
+
 hid = ["async-hid"]
-snapi = ["hid"]
+usb = []
+
+snapi = ["hid", "usb"]
+
 runtime-smol = ["smol"]
 runtime-tokio = ["tokio"]
+
+web = ["tsify", "wasm-bindgen"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -27,6 +33,8 @@ num_enum = { version = "0.7.5" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 tracing = "0.1.41"
+tsify = { version = "0.5.6", optional = true, features = ["js"] }
+wasm-bindgen = { version = "0.2.104", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-hid = { version = "0.4.4", optional = true, default-features = false, features = [
@@ -34,7 +42,7 @@ async-hid = { version = "0.4.4", optional = true, default-features = false, feat
     "winrt",
 ] }
 smol = { version = "2.0.2", optional = true }
-tokio = { version = "1.48.0", optional = true }
+tokio = { version = "1.48.0", optional = true, features = ["rt"]}
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 serde-wasm-bindgen = "0.6.5"
@@ -46,6 +54,12 @@ web-sys = { version = "0.3.81", features = [
     "HidDeviceRequestOptions",
     "HidInputReportEvent",
     "Navigator",
+    "Usb",
+    "UsbDevice",
+    "UsbDeviceFilter",
+    "UsbDeviceRequestOptions",
+    "UsbInTransferResult",
+    "UsbOutTransferResult",
     "Window",
 ] }
 

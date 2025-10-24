@@ -1,9 +1,11 @@
 use itertools::{Itertools, Position};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
-use serde::Serialize;
+use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
+use serde::{Deserialize, Serialize};
 use tracing::{instrument, trace, warn};
 
-use crate::scanner::snapi::{HidInput, HidOutput, SnapiError, code_types::CodeType};
+use crate::scanner::snapi::{
+    HidInput, HidOutput, SnapiError, SnapiNotification, code_types::CodeType,
+};
 
 pub const PACKET_LEN: usize = 32;
 
@@ -11,6 +13,7 @@ pub const PACKET_LEN: usize = 32;
 pub enum SnapiPacket {
     Status(SnapiStatus),
     Barcode(SnapiBarcodePacket),
+    Notification(SnapiNotification),
     Attribute(SnapiAttributePacket),
     Other { hid_input: HidInput, data: Vec<u8> },
 }
@@ -20,8 +23,9 @@ impl SnapiPacket {
         let packet = match HidInput::from(data[0]) {
             HidInput::Status => SnapiStatus::decode(data)?.packet(),
             HidInput::Barcode => SnapiBarcodePacket::decode(data)?.packet(),
+            HidInput::Notification => SnapiNotification::decode(data)?.packet(),
             HidInput::Attribute => SnapiAttributePacket::decode(data)?.packet(),
-            hid_input @ HidInput::Unknown(_) => SnapiPacket::Other {
+            hid_input => SnapiPacket::Other {
                 hid_input,
                 data: data.to_vec(),
             },
@@ -316,7 +320,7 @@ impl DecodableSnapiPacket for SnapiAttributePacket {
 }
 
 impl CollatableSnapiPacket for SnapiAttributePacket {
-    type Output = Option<Option<SnapiAttributeValue>>;
+    type Output = Option<SnapiAttributeResponse>;
 
     fn collate(self, packets: &mut Vec<Self>) -> Result<Self::Output, SnapiError> {
         let has_next = self.flags.has_next;
@@ -333,14 +337,14 @@ impl CollatableSnapiPacket for SnapiAttributePacket {
             .flat_map(|attribute| attribute.data)
             .collect();
         trace!("got packet data: {}", hex::encode(&data));
-        let value = SnapiAttributeValue::decode(&data)?;
+        let value = SnapiAttributeResponse::decode(&data)?;
         trace!(?value, "got attribute value");
 
         Ok(Some(value))
     }
 }
 
-impl SnapiPacketOutput for Option<SnapiAttributeValue> {
+impl SnapiPacketOutput for SnapiAttributeResponse {
     fn output(self) -> Option<SnapiOutput> {
         Some(SnapiOutput::Attribute(self))
     }
@@ -351,7 +355,8 @@ impl SnapiPacketOutput for Option<SnapiAttributeValue> {
 pub enum SnapiOutput {
     Status(SnapiStatus),
     Barcode(SnapiBarcode),
-    Attribute(Option<SnapiAttributeValue>),
+    Notification(SnapiNotification),
+    Attribute(SnapiAttributeResponse),
     Other { hid_input: HidInput, data: Vec<u8> },
 }
 
@@ -362,7 +367,89 @@ pub struct SnapiBarcode {
     pub code_type: CodeType,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, FromPrimitive, IntoPrimitive)]
+#[repr(u8)]
+pub enum SnapiAttributeRequest {
+    GetId = 0x01,
+    Get = 0x02,
+    Set = 0x05,
+    Store = 0x06,
+    #[num_enum(catch_all)]
+    Unknown(u8),
+}
+
+impl serde::Serialize for SnapiAttributeRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8((*self).into())
+    }
+}
+
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase", tag = "type", content = "value")]
+pub enum SnapiAttributeResponse {
+    GetId(Vec<u16>),
+    Get(Option<SnapiAttributeValue>),
+    Set,
+    Store,
+    Unknown {
+        request: SnapiAttributeRequest,
+        data: Vec<u8>,
+    },
+}
+
+impl SnapiAttributeResponse {
+    pub fn decode(data: &[u8]) -> Result<Self, SnapiError> {
+        match SnapiAttributeRequest::from(data[2]) {
+            SnapiAttributeRequest::GetId => {
+                let ids = data[6..]
+                    .chunks_exact(2)
+                    .map(|chunk| {
+                        u16::from_be_bytes(
+                            chunk.try_into().expect("chunk must always be two bytes"),
+                        )
+                    })
+                    .collect();
+                Ok(SnapiAttributeResponse::GetId(ids))
+            }
+            SnapiAttributeRequest::Get => {
+                SnapiAttributeValue::decode(data).map(SnapiAttributeResponse::Get)
+            }
+            SnapiAttributeRequest::Set => Ok(SnapiAttributeResponse::Set),
+            SnapiAttributeRequest::Store => Ok(SnapiAttributeResponse::Store),
+            request @ SnapiAttributeRequest::Unknown(_) => Ok(SnapiAttributeResponse::Unknown {
+                request,
+                data: data.to_vec(),
+            }),
+        }
+    }
+}
+
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
+#[cfg_attr(feature = "web", tsify(into_wasm_abi, from_wasm_abi))]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Debug, FromPrimitive, IntoPrimitive, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum SnapiAttributeType {
+    Flag = b'F',
+    Byte = b'B',
+    Word = b'W',
+    DWord = b'D',
+    String = b'S',
+    Array = b'A',
+    Action = b'X',
+    Empty = 0x00,
+    #[num_enum(catch_all)]
+    Unknown(u8),
+}
+
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
+#[cfg_attr(feature = "web", tsify(into_wasm_abi, from_wasm_abi))]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", tag = "type", content = "value")]
 pub enum SnapiAttributeValue {
     Flag(bool),
@@ -371,47 +458,121 @@ pub enum SnapiAttributeValue {
     DWord(u32),
     String(String),
     Array(Vec<u8>),
+    Action(u16),
+    Unknown {
+        attribute_type: SnapiAttributeType,
+        data: Vec<u8>,
+    },
 }
 
 impl SnapiAttributeValue {
+    pub fn attribute_type(&self) -> SnapiAttributeType {
+        match self {
+            Self::Flag(_) => SnapiAttributeType::Flag,
+            Self::Byte(_) => SnapiAttributeType::Byte,
+            Self::Word(_) => SnapiAttributeType::Word,
+            Self::DWord(_) => SnapiAttributeType::DWord,
+            Self::String(_) => SnapiAttributeType::String,
+            Self::Array(_) => SnapiAttributeType::Array,
+            Self::Action(_) => SnapiAttributeType::Action,
+            Self::Unknown { attribute_type, .. } => *attribute_type,
+        }
+    }
+
     pub fn decode(data: &[u8]) -> Result<Option<Self>, SnapiError> {
         if data.len() < 7 {
             return Ok(None);
         }
 
-        let value = match data[6] {
-            b'F' => SnapiAttributeValue::Flag(data[8] > 0),
-            b'B' => SnapiAttributeValue::Byte(data[8]),
-            b'W' => SnapiAttributeValue::Word(u16::from_le_bytes([data[8], data[9]])),
-            b'D' => SnapiAttributeValue::DWord(u32::from_le_bytes([
+        let value = match SnapiAttributeType::from(data[6]) {
+            SnapiAttributeType::Flag => SnapiAttributeValue::Flag(data[8] > 0),
+            SnapiAttributeType::Byte => SnapiAttributeValue::Byte(data[8]),
+            SnapiAttributeType::Word => {
+                SnapiAttributeValue::Word(u16::from_le_bytes([data[8], data[9]]))
+            }
+            SnapiAttributeType::DWord => SnapiAttributeValue::DWord(u32::from_le_bytes([
                 data[8], data[9], data[10], data[11],
             ])),
-            b'S' => {
+            SnapiAttributeType::String => {
                 // Strings are null terminated, ignore the last byte.
-                let data = &data[12..12 + usize::from(data[9]) - 1];
-                trace!("attempting to parse string from {}", hex::encode(data));
-                String::from_utf8(data.to_vec())
-                    .map(SnapiAttributeValue::String)
-                    .unwrap_or_else(|err| {
-                        let bytes = err.into_bytes();
-                        warn!(
-                            "expected string but not valid utf-8, returning as array: {}",
-                            hex::encode(&bytes)
-                        );
-                        SnapiAttributeValue::Array(bytes)
-                    })
+                let pos = 12 + usize::from(data[9]) - 1;
+                if pos <= 12 {
+                    warn!("empty string");
+                    SnapiAttributeValue::String(String::new())
+                } else {
+                    let data = &data[12..12 + usize::from(data[9]) - 1];
+                    trace!("attempting to parse string from {}", hex::encode(data));
+                    String::from_utf8(data.to_vec())
+                        .map(SnapiAttributeValue::String)
+                        .unwrap_or_else(|err| {
+                            let bytes = err.into_bytes();
+                            warn!(
+                                "expected string but not valid utf-8, returning as array: {}",
+                                hex::encode(&bytes)
+                            );
+                            SnapiAttributeValue::Array(bytes)
+                        })
+                }
             }
-            b'A' => todo!(),
-            0 => return Ok(None),
-            value => {
-                return Err(SnapiError::UnexpectedValue {
-                    value,
-                    name: "attribute type".into(),
-                });
+            SnapiAttributeType::Array => {
+                let len = usize::from(data[10]);
+                trace!("{data:?}, {len}");
+                SnapiAttributeValue::Array(data[13..13 + len].to_vec())
             }
+            SnapiAttributeType::Empty => return Ok(None),
+            attribute_type => SnapiAttributeValue::Unknown {
+                attribute_type,
+                data: data.to_vec(),
+            },
         };
 
         Ok(Some(value))
+    }
+
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let data = match self {
+            SnapiAttributeValue::Flag(value) => {
+                vec![SnapiAttributeType::Flag.into(), 0x00, *value as u8]
+            }
+            SnapiAttributeValue::Byte(value) => vec![SnapiAttributeType::Byte.into(), 0x00, *value],
+            SnapiAttributeValue::Word(value) => {
+                let bytes = value.to_be_bytes();
+                vec![SnapiAttributeType::Word.into(), bytes[0], bytes[1]]
+            }
+            SnapiAttributeValue::DWord(value) => {
+                let bytes = value.to_be_bytes();
+                vec![
+                    SnapiAttributeType::DWord.into(),
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                    bytes[3],
+                ]
+            }
+            SnapiAttributeValue::Action(value) => {
+                let bytes = value.to_le_bytes();
+                vec![SnapiAttributeType::Action.into(), bytes[0], bytes[1]]
+            }
+            SnapiAttributeValue::String(value) => {
+                let mut bytes = Vec::with_capacity(6 + value.len());
+                bytes.extend_from_slice(&[SnapiAttributeType::String.into(), 0x00]);
+                bytes.extend_from_slice(&i16::try_from(value.len()).unwrap().to_be_bytes());
+                bytes.extend_from_slice(&[0x00, 0x00]);
+                bytes.extend_from_slice(value.as_bytes());
+                bytes
+            }
+            SnapiAttributeValue::Array(_) => {
+                todo!()
+            }
+            SnapiAttributeValue::Unknown { .. } => return None,
+        };
+
+        debug_assert!(
+            SnapiAttributeType::from(data[0]) == self.attribute_type(),
+            "encoded data must be of same type"
+        );
+
+        Some(data)
     }
 }
 
@@ -420,7 +581,9 @@ impl SnapiAttributeValue {
 /// Data may not be longer than `u16::MAX` otherwise this function will panic.
 #[instrument]
 pub(crate) fn encode_attribute_request(data: &[u8]) -> impl Iterator<Item = Vec<u8>> {
-    let total_length = u16::try_from(data.len()).unwrap().to_be_bytes();
+    let total_length = u16::try_from(data.len())
+        .expect("data length must always fit in u16")
+        .to_be_bytes();
 
     // Each packet can be up to the maximum length minus the 4 header bytes, so
     // we can chunk the data on that size. We also need to know the position of

@@ -37,6 +37,14 @@ fn main() {
         let serial_number = device.get_attribute(534).await.unwrap();
         info!(?serial_number);
 
+        let attribute_ids = device.get_all_attribute_ids().await.unwrap();
+        info!("device has {} attributes", attribute_ids.len());
+
+        device
+            .set_attribute(6000, false, snapi::packet::SnapiAttributeValue::Action(9))
+            .await
+            .unwrap();
+
         while let Some(event) = packets.next().await {
             info!("got event: {}", hex::encode(&event));
 
