@@ -120,6 +120,10 @@ pub enum SnapiError {
     MismatchedData { name: &'static str },
     #[error("usb error: {message}")]
     Usb { message: String },
+    #[error("data too short")]
+    TooShort { expected: usize, actual: usize },
+    #[error("only got partial data")]
+    PartialData { expected: usize, got: Vec<u8> },
 }
 
 impl SnapiError {
@@ -329,11 +333,44 @@ impl<H: WritableHidDevice, U> Snapi<H, U> {
         let id_bytes = attribute_id.to_be_bytes();
         let command = [0x00, 0x06, 0x02, 0x00, id_bytes[0], id_bytes[1]];
 
-        match self.write_attribute_command(&command).await? {
-            SnapiAttributeResponse::Get(value) => Ok(value),
-            _ => Err(SnapiError::MismatchedData {
+        match self.write_attribute_command(&command).await {
+            Ok(SnapiAttributeResponse::Get(value)) => Ok(value),
+            Ok(_) => Err(SnapiError::MismatchedData {
                 name: "attribute get",
             }),
+            // Long attributes are only partially sent per request. We have to
+            // make more requests to fetch the rest of the data.
+            Err(SnapiError::PartialData { expected, mut got }) => {
+                debug!("got partial data, requesting rest of data");
+
+                while got.len() < expected {
+                    debug!(expected, len = got.len(), "making request for next data");
+                    let len_bytes = u16::try_from(got.len()).unwrap().to_be_bytes();
+                    match self
+                        .write_attribute_command(&[
+                            0x00,
+                            0x08,
+                            0x04,
+                            0x00,
+                            id_bytes[0],
+                            id_bytes[1],
+                            len_bytes[0],
+                            len_bytes[1],
+                        ])
+                        .await?
+                    {
+                        SnapiAttributeResponse::GetOffset(data) => got.extend_from_slice(&data),
+                        _ => {
+                            return Err(SnapiError::MismatchedData {
+                                name: "attribute get offset",
+                            });
+                        }
+                    }
+                }
+
+                Ok(Some(SnapiAttributeValue::Array(got)))
+            }
+            Err(err) => return Err(err),
         }
     }
 

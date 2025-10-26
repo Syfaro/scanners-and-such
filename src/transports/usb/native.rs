@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use nusb::transfer::Bulk;
-use tracing::debug;
 
 use crate::transports::{
     UsbFilter,
@@ -89,8 +88,6 @@ impl UsbDevice for UsbDeviceNative {
         }
 
         let claimed_interface = self.device.claim_interface(interface).await?;
-
-        debug!("{:#?}", claimed_interface.descriptors().collect::<Vec<_>>());
 
         self.interfaces.insert(interface, claimed_interface);
 
