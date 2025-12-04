@@ -98,7 +98,7 @@ impl WritableHidDevice for HidDevice {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ClosableHidDevice for HidDevice {
     async fn close(&mut self) -> Result<(), HidError> {
         // We don't have exclusive use over HID devices on native platforms, so

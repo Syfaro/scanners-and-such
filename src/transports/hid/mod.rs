@@ -51,7 +51,8 @@ pub trait OpenableHidDevice {
     ) -> Result<(Self::Device, impl Stream<Item = Vec<u8>> + Send), HidError>;
 }
 
-#[async_trait(?Send)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait ClosableHidDevice {
     async fn close(&mut self) -> Result<(), HidError>;
 }
