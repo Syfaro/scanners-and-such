@@ -1,54 +1,29 @@
 use async_hid::{AsyncHidRead, AsyncHidWrite};
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryFutureExt, future};
+use futures::{Stream, StreamExt, future};
 use tracing::error;
 
-use crate::transports::hid::{
-    ClosableHidDevice, HidDiscoveredDevice, HidError, HidTransport, OpenableHidDevice, UsbFilter,
-    WritableHidDevice,
-};
-
-impl HidError {
-    fn new(message: impl Into<String>, inner: Option<async_hid::HidError>) -> Self {
-        Self {
-            message: message.into(),
-            inner,
-        }
-    }
-}
+use crate::transports::hid::{HidDevice, HidTransport, UsbFilter};
 
 pub struct HidTransportNative;
 
-pub struct HidDevice {
-    wtr: async_hid::DeviceWriter,
-}
-
-impl From<async_hid::Device> for HidDiscoveredDevice {
-    fn from(value: async_hid::Device) -> Self {
-        Self { device: value }
-    }
-}
-
-impl HidDiscoveredDevice {
-    pub fn into_inner(self) -> async_hid::Device {
-        self.device
-    }
-}
-
 #[async_trait(?Send)]
 impl HidTransport for HidTransportNative {
-    async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<HidDiscoveredDevice>, HidError> {
+    type DiscoveredDevice = async_hid::Device;
+    type Error = async_hid::HidError;
+
+    async fn get_devices(
+        filters: &[UsbFilter],
+    ) -> Result<Vec<Self::DiscoveredDevice>, Self::Error> {
         let backend = async_hid::HidBackend::default();
         let devices = backend
             .enumerate()
-            .await
-            .map_err(|err| HidError::new("could not enumerate devices", Some(err)))?
+            .await?
             .filter(|device| {
                 future::ready(filters.iter().any(|filter| {
                     device.vendor_id == filter.vendor_id && device.product_id == filter.product_id
                 }))
             })
-            .map(|device| HidDiscoveredDevice { device })
             .collect()
             .await;
 
@@ -56,20 +31,21 @@ impl HidTransport for HidTransportNative {
     }
 }
 
-#[async_trait(?Send)]
-impl OpenableHidDevice for HidDiscoveredDevice {
-    type Device = HidDevice;
+pub struct NativeHidDevice {
+    wtr: async_hid::DeviceWriter,
+}
 
-    async fn open<const BUFFER_LEN: usize>(
-        self,
-    ) -> Result<(Self::Device, impl Stream<Item = Vec<u8>>), HidError> {
-        let (rdr, wtr) = self
-            .device
-            .open()
-            .map_err(|err| HidError::new("could not open device", Some(err)))
-            .await?;
+#[async_trait]
+impl HidDevice for NativeHidDevice {
+    type DiscoveredDevice = async_hid::Device;
+    type Error = async_hid::HidError;
 
-        let device = HidDevice { wtr };
+    async fn new<const BUFFER_LEN: usize>(
+        discovered_device: Self::DiscoveredDevice,
+    ) -> Result<(Self, impl Stream<Item = Vec<u8>>), async_hid::HidError> {
+        let (rdr, wtr) = discovered_device.open().await?;
+
+        let device = NativeHidDevice { wtr };
 
         let stream =
             futures::stream::unfold((rdr, [0u8; BUFFER_LEN]), |(mut rdr, mut buf)| async move {
@@ -86,21 +62,12 @@ impl OpenableHidDevice for HidDiscoveredDevice {
 
         Ok((device, stream))
     }
-}
 
-#[async_trait]
-impl WritableHidDevice for HidDevice {
-    async fn write_report(&mut self, data: &mut [u8]) -> Result<(), HidError> {
-        self.wtr
-            .write_output_report(data)
-            .await
-            .map_err(|err| HidError::new("could not write output report", Some(err)))
+    async fn write_report(&mut self, data: &mut [u8]) -> Result<(), Self::Error> {
+        self.wtr.write_output_report(data).await
     }
-}
 
-#[async_trait]
-impl ClosableHidDevice for HidDevice {
-    async fn close(&mut self) -> Result<(), HidError> {
+    async fn close(&mut self) -> Result<(), Self::Error> {
         // We don't have exclusive use over HID devices on native platforms, so
         // nothing needs to happen here.
         Ok(())

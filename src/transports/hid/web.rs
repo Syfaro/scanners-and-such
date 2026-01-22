@@ -8,41 +8,38 @@ use web_sys::{
     wasm_bindgen::{JsCast, JsValue, prelude::Closure},
 };
 
-use crate::transports::hid::{
-    ClosableHidDevice, HidDiscoveredDevice, HidError, HidTransport, OpenableHidDevice, UsbFilter,
-    WritableHidDevice,
-};
+use crate::transports::hid::{HidDevice, HidTransport, UsbFilter};
 
-impl HidError {
-    fn new(message: impl Into<String>, inner: Option<JsValue>) -> Self {
+#[derive(Debug)]
+pub struct WebHidError {
+    pub message: String,
+}
+
+impl WebHidError {
+    fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            inner,
         }
     }
 }
 
+impl std::fmt::Display for WebHidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for WebHidError {}
+
 pub struct HidTransportWeb;
 
-pub struct HidDevice {
+pub struct HidDeviceWeb {
     device: web_sys::HidDevice,
     // Hold the reference to the closure until we drop the device.
     listener: Closure<dyn FnMut(Event)>,
 }
 
-impl From<web_sys::HidDevice> for HidDiscoveredDevice {
-    fn from(value: web_sys::HidDevice) -> Self {
-        Self { device: value }
-    }
-}
-
-impl HidDiscoveredDevice {
-    pub fn into_inner(self) -> web_sys::HidDevice {
-        self.device
-    }
-}
-
-impl Drop for HidDevice {
+impl Drop for HidDeviceWeb {
     fn drop(&mut self) {
         if let Err(err) = self.device.remove_event_listener_with_callback(
             "inputreport",
@@ -62,60 +59,58 @@ impl Drop for HidDevice {
 }
 
 impl HidTransportWeb {
-    fn get_hid() -> Result<web_sys::Hid, HidError> {
-        let window =
-            web_sys::window().ok_or_else(|| HidError::new("missing window object", None))?;
+    fn get_hid() -> Result<web_sys::Hid, WebHidError> {
+        let window = web_sys::window().ok_or_else(|| WebHidError::new("missing window object"))?;
         let navigator = window.navigator();
 
         if !Reflect::has(&navigator, &JsValue::from_str("hid"))
-            .map_err(|err| HidError::new("could not check navigator for hid", Some(err)))?
+            .map_err(|_err| WebHidError::new("could not check navigator for hid"))?
         {
-            return Err(HidError::new("navigator was missing hid object", None));
+            return Err(WebHidError::new("navigator was missing hid object"));
         }
 
         Ok(navigator.hid())
     }
 
-    fn extract_devices(value: JsValue) -> Result<Vec<HidDiscoveredDevice>, HidError> {
+    fn extract_devices(value: JsValue) -> Result<Vec<web_sys::HidDevice>, WebHidError> {
         value
             .dyn_into::<Array>()
-            .map_err(|err| HidError::new("hid devices were not array", Some(err)))?
+            .map_err(|_err| WebHidError::new("hid devices were not array"))?
             .into_iter()
-            .map(|device| {
-                device
-                    .dyn_into::<web_sys::HidDevice>()
-                    .map(|device| HidDiscoveredDevice { device })
-            })
+            .map(|device| device.dyn_into::<web_sys::HidDevice>())
             .collect::<Result<_, _>>()
-            .map_err(|err| HidError::new("returned object was not hid device", Some(err)))
+            .map_err(|_err| WebHidError::new("returned object was not hid device"))
     }
 }
 
 #[async_trait(?Send)]
 impl HidTransport for HidTransportWeb {
-    async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<HidDiscoveredDevice>, HidError> {
+    type DiscoveredDevice = web_sys::HidDevice;
+    type Error = WebHidError;
+
+    async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<web_sys::HidDevice>, WebHidError> {
         let filters = serde_wasm_bindgen::to_value(filters)
-            .map_err(|err| HidError::new("failed to serialize filters", Some(err.into())))?;
+            .map_err(|_err| WebHidError::new("failed to serialize filters"))?;
         let request_opts = HidDeviceRequestOptions::new(&filters);
 
         let hid = Self::get_hid()?;
 
         let devices = JsFuture::from(hid.request_device(&request_opts))
             .await
-            .map_err(|err| HidError::new("request device call failed", Some(err)))?;
+            .map_err(|_err| WebHidError::new("request device call failed"))?;
 
         Self::extract_devices(devices)
     }
 }
 
-impl HidDiscoveredDevice {
+impl HidDeviceWeb {
     fn process_event<const BUFFER_LEN: usize>(
         tx: mpsc::Sender<Vec<u8>>,
         ev: Event,
-    ) -> Result<(), HidError> {
+    ) -> Result<(), WebHidError> {
         let input_evt: HidInputReportEvent = ev
             .dyn_into()
-            .map_err(|_| HidError::new("event was not hid input report", None))?;
+            .map_err(|_| WebHidError::new("event was not hid input report"))?;
 
         let arr = Uint8Array::new(&input_evt.data().buffer());
 
@@ -124,10 +119,9 @@ impl HidDiscoveredDevice {
         trace!(len, "got hid input report: {report_id:02X}");
 
         if len - 1 > BUFFER_LEN {
-            return Err(HidError::new(
-                format!("packet length {len} was greater than buffer length {BUFFER_LEN}",),
-                None,
-            ));
+            return Err(WebHidError::new(format!(
+                "packet length {len} was greater than buffer length {BUFFER_LEN}"
+            )));
         }
 
         let mut buf = vec![0u8; len + 1];
@@ -147,62 +141,57 @@ impl HidDiscoveredDevice {
 }
 
 #[async_trait(?Send)]
-impl OpenableHidDevice for HidDiscoveredDevice {
-    type Device = HidDevice;
+impl HidDevice for HidDeviceWeb {
+    type DiscoveredDevice = web_sys::HidDevice;
+    type Error = WebHidError;
 
-    async fn open<const BUFFER_LEN: usize>(
-        self,
-    ) -> Result<(Self::Device, impl Stream<Item = Vec<u8>> + Send), HidError> {
-        JsFuture::from(self.device.open())
+    async fn new<const BUFFER_LEN: usize>(
+        discovered_device: web_sys::HidDevice,
+    ) -> Result<(Self, impl Stream<Item = Vec<u8>>), WebHidError> {
+        JsFuture::from(discovered_device.open())
             .await
-            .map_err(|err| HidError::new("failed to open device", Some(err)))?;
+            .map_err(|_err| WebHidError::new("failed to open device"))?;
 
         let (tx, rx) = mpsc::channel(1);
 
         let listener = Closure::wrap(Box::new(move |ev: Event| {
             if let Err(err) = Self::process_event::<BUFFER_LEN>(tx.clone(), ev) {
-                error!("could not process input report: {err}");
+                error!("could not process input report: {}", err.message);
             }
         }) as Box<dyn FnMut(Event)>);
 
-        self.device
+        discovered_device
             .add_event_listener_with_callback("inputreport", listener.as_ref().unchecked_ref())
-            .map_err(|err| HidError::new("failed to add report callback", Some(err)))?;
+            .map_err(|_err| WebHidError::new("failed to add report callback"))?;
 
         Ok((
-            HidDevice {
-                device: self.device,
+            HidDeviceWeb {
+                device: discovered_device,
                 listener,
             },
             rx,
         ))
     }
-}
 
-#[async_trait(?Send)]
-impl WritableHidDevice for HidDevice {
-    async fn write_report(&mut self, data: &mut [u8]) -> Result<(), HidError> {
+    async fn write_report(&mut self, data: &mut [u8]) -> Result<(), WebHidError> {
         let promise = self
             .device
             .send_report_with_u8_slice(data[0], &mut data[1..])
-            .map_err(|err| HidError::new("failed to prepare sending report", Some(err)))?;
+            .map_err(|_err| WebHidError::new("failed to prepare sending report"))?;
 
         JsFuture::from(promise)
             .await
-            .map_err(|err| HidError::new("failed to write report", Some(err)))?;
+            .map_err(|_err| WebHidError::new("failed to write report"))?;
 
         Ok(())
     }
-}
 
-#[async_trait(?Send)]
-impl ClosableHidDevice for HidDevice {
-    async fn close(&mut self) -> Result<(), HidError> {
+    async fn close(&mut self) -> Result<(), WebHidError> {
         let promise = self.device.close();
 
         JsFuture::from(promise)
             .await
-            .map_err(|err| HidError::new("failed to close device", Some(err)))?;
+            .map_err(|_err| WebHidError::new("failed to close device"))?;
 
         Ok(())
     }

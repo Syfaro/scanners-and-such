@@ -3,7 +3,7 @@ use scanners_and_such::{
     scanner::snapi,
     transports::{
         UsbFilter,
-        hid::{HidTransport, OpenableHidDevice},
+        hid::{HidDevice, HidTransport, native::NativeHidDevice},
         usb::{UsbDevice, UsbTransport},
     },
 };
@@ -56,8 +56,7 @@ fn main() {
                 .await
                 .unwrap();
 
-        let (device, packets) = hid_device
-            .open::<{ snapi::packet::PACKET_LEN }>()
+        let (device, packets) = NativeHidDevice::new::<{ snapi::packet::PACKET_LEN }>(hid_device)
             .await
             .unwrap();
         let (mut device, packets) = snapi::Snapi::new(device, packets).await.unwrap();

@@ -5,10 +5,7 @@ use std::{rc::Rc, sync::atomic::AtomicBool};
 use futures::{StreamExt, lock::Mutex};
 use scanners_and_such::{
     scanner::snapi,
-    transports::{
-        hid::{HidDiscoveredDevice, OpenableHidDevice},
-        usb::UsbDevice,
-    },
+    transports::{hid::HidDevice, usb::UsbDevice},
 };
 use tracing::{debug, error};
 use wasm_bindgen::{JsError, JsValue, prelude::wasm_bindgen};
@@ -40,7 +37,7 @@ pub fn enable_logging() {
 pub fn enable_logging() {}
 
 type SnapiDevice = snapi::Snapi<
-    scanners_and_such::transports::hid::HidDefaultDevice,
+    scanners_and_such::transports::hid::web::HidDeviceWeb,
     scanners_and_such::transports::usb::web::UsbDeviceWeb,
 >;
 
@@ -78,9 +75,7 @@ impl SnapiDeviceManager {
         #[wasm_bindgen(param_description = "callback to be executed on every complete output")]
         callback: js_sys::Function,
     ) -> Result<(), JsError> {
-        let (device, packets) = HidDiscoveredDevice::from(device)
-            .open::<{ snapi::packet::PACKET_LEN }>()
-            .await?;
+        let (device, packets) = HidDevice::new::<{ snapi::packet::PACKET_LEN }>(device).await?;
         let (device, mut packets) = snapi::Snapi::new(device, packets).await?;
 
         *self.device.lock().await = Some(device);

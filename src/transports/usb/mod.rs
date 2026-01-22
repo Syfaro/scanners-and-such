@@ -4,7 +4,6 @@ use crate::transports::UsbFilter;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
-// #[cfg(any(target_arch = "wasm32", feature = "web"))]
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 

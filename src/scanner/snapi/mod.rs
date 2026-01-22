@@ -13,7 +13,7 @@ use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use crate::{
     scanner::snapi::packet::*,
     transports::{
-        hid::{ClosableHidDevice, HidError, WritableHidDevice},
+        hid::HidDevice,
         usb::{UsbDevice, UsbDeviceTransportInput},
     },
 };
@@ -106,8 +106,8 @@ impl serde::Serialize for SnapiNotification {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapiError {
-    #[error("hid error: {0}")]
-    Hid(#[from] HidError),
+    #[error("hid error: {message}")]
+    Hid { message: String },
     #[error("unexpected value {value:02X} when parsing field {name}")]
     UnexpectedValue { value: u8, name: Cow<'static, str> },
     #[error("got bad response code: {:?}", status.response_code)]
@@ -178,7 +178,7 @@ pub enum MacroPdfAction {
     Abort = 0x01,
 }
 
-impl<H: WritableHidDevice, U> Snapi<H, U> {
+impl<H: HidDevice, U> Snapi<H, U> {
     /// Create a new SNAPI device from a HID device and initialize it.
     pub async fn new(
         hid: H,
@@ -381,7 +381,7 @@ impl<H: WritableHidDevice, U> Snapi<H, U> {
         store: bool,
         value: SnapiAttributeValue,
     ) -> Result<(), SnapiError> {
-        let data = value.encode().ok_or_else(|| SnapiError::MismatchedData {
+        let data = value.encode().ok_or(SnapiError::MismatchedData {
             name: "cannot encode unknown value",
         })?;
 
@@ -427,7 +427,12 @@ impl<H: WritableHidDevice, U> Snapi<H, U> {
         if read_status {
             Arc::clone(&self.pending)
                 .input_single(HidInput::Status, async move |mut rx| {
-                    self.hid_device.write_report(packet).await?;
+                    self.hid_device
+                        .write_report(packet)
+                        .await
+                        .map_err(|err| SnapiError::Hid {
+                            message: format!("{err:?}"),
+                        })?;
 
                     trace!("reading status");
                     self.read_status(&mut rx)
@@ -438,7 +443,12 @@ impl<H: WritableHidDevice, U> Snapi<H, U> {
                 })
                 .await?;
         } else {
-            self.hid_device.write_report(packet).await?;
+            self.hid_device
+                .write_report(packet)
+                .await
+                .map_err(|err| SnapiError::Hid {
+                    message: format!("{err:?}"),
+                })?;
         }
 
         Ok(())
@@ -459,7 +469,7 @@ impl<H: WritableHidDevice, U> Snapi<H, U> {
                 let value = loop {
                     trace!("waiting for attribute response");
 
-                    let buf = rx.next().await.ok_or_else(|| SnapiError::Channel {
+                    let buf = rx.next().await.ok_or(SnapiError::Channel {
                         name: "attribute response",
                     })?;
                     let value = buf[0];
@@ -543,9 +553,7 @@ impl<H: WritableHidDevice, U> Snapi<H, U> {
 
         Ok(output)
     }
-}
 
-impl<H: ClosableHidDevice, U> Snapi<H, U> {
     pub async fn close(mut self) -> Result<(), SnapiError> {
         self.is_connected = false;
 
@@ -557,13 +565,18 @@ impl<H: ClosableHidDevice, U> Snapi<H, U> {
             })?;
         }
 
-        self.hid_device.close().await?;
+        self.hid_device
+            .close()
+            .await
+            .map_err(|err| SnapiError::Hid {
+                message: format!("{err:?}"),
+            })?;
 
         Ok(())
     }
 }
 
-impl<H: WritableHidDevice, U: UsbDevice + 'static> Snapi<H, U> {
+impl<H: HidDevice, U: UsbDevice + 'static> Snapi<H, U> {
     pub async fn attach_usb_device(
         &mut self,
         mut usb_device: U,
