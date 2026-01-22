@@ -3,6 +3,7 @@ name = "scanners-and-such-web"
 version = "0.1.0"
 edition = "2024"
 authors = ["Syfaro <syfaro@huefox.com>"]
+publish = false
 
 [package.metadata.wasm-pack.profile.dev.wasm-bindgen]
 dwarf-debug-info = true
