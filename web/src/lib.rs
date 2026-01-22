@@ -62,7 +62,7 @@ impl SnapiDeviceManager {
         self.device.lock().await.is_some()
     }
 
-    #[wasm_bindgen(return_description = "if a USB device is attached")]
+    #[wasm_bindgen(js_name = "usbDeviceAttached", return_description = "if a USB device is attached")]
     pub async fn usb_device_attached(&self) -> bool {
         self.has_usb_device
             .load(std::sync::atomic::Ordering::SeqCst)
