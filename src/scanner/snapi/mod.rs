@@ -572,7 +572,19 @@ impl<H: HidDevice, U> Snapi<H, U> {
                 message: format!("{err:?}"),
             })?;
 
+        self.cancel_usb_tasks().await;
+
         Ok(())
+    }
+
+    async fn cancel_usb_tasks(&mut self) {
+        for (_, cancel_tx) in std::mem::take(&mut self.cancel_usb_tasks) {
+            let (tx, rx) = oneshot::channel();
+
+            if cancel_tx.send(tx).is_ok() {
+                let _ = rx.await;
+            }
+        }
     }
 }
 
@@ -701,13 +713,7 @@ impl<H: HidDevice, U: UsbDevice + 'static> Snapi<H, U> {
     }
 
     pub async fn detach_usb_device(&mut self) -> Result<Option<U>, SnapiError> {
-        for (_, cancel_tx) in std::mem::take(&mut self.cancel_usb_tasks) {
-            let (tx, rx) = oneshot::channel();
-
-            if cancel_tx.send(tx).is_ok() {
-                let _ = rx.await;
-            }
-        }
+        self.cancel_usb_tasks();
 
         Ok(self.usb.take().map(|usb| usb.0))
     }
