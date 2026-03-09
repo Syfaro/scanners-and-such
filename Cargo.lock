@@ -785,7 +785,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "scanners-and-such"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-hid",
  "async-trait",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "scanners-and-such-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "console_error_panic_hook",
  "futures",
