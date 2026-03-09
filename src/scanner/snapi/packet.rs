@@ -1,6 +1,7 @@
 use itertools::{Itertools, Position};
 use num_enum::{FromPrimitive, IntoPrimitive, TryFromPrimitive};
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use tracing::{instrument, trace, warn};
 
 use crate::scanner::snapi::{
@@ -88,6 +89,7 @@ macro_rules! require_length {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[serde(rename_all = "camelCase")]
 pub struct SnapiStatus {
     pub hid_output: HidOutput,
@@ -96,6 +98,7 @@ pub struct SnapiStatus {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, TryFromPrimitive, IntoPrimitive)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u8)]
 pub enum SnapiResponseCode {
     Success = 0x01,
@@ -114,6 +117,7 @@ impl serde::Serialize for SnapiResponseCode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, TryFromPrimitive, IntoPrimitive)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u8)]
 pub enum SnapiExtendedResponseCode {
     Empty = 0x00,
@@ -239,7 +243,7 @@ impl CollatableSnapiPacket for SnapiBarcodePacket {
             }
 
             Ok(Some(SnapiBarcode {
-                data: self.data,
+                data: self.data.into(),
                 code_type: self.code_type,
             }))
         } else if self.packet_count == self.packet_index + 1 {
@@ -260,7 +264,11 @@ impl CollatableSnapiPacket for SnapiBarcodePacket {
 
             let packets = std::mem::take(packets);
 
-            let data = packets.into_iter().flat_map(|packet| packet.data).collect();
+            let data = packets
+                .into_iter()
+                .flat_map(|packet| packet.data)
+                .collect::<Vec<_>>()
+                .into();
 
             Ok(Some(SnapiBarcode { data, code_type }))
         } else {
@@ -371,23 +379,26 @@ impl SnapiPacketOutput for SnapiAttributeResponse {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[serde(rename_all = "camelCase", tag = "type", content = "value")]
 pub enum SnapiOutput {
     Status(SnapiStatus),
     Barcode(SnapiBarcode),
     Notification(SnapiNotification),
     Attribute(SnapiAttributeResponse),
-    Other { hid_input: HidInput, data: Vec<u8> },
+    Other { hid_input: HidInput, data: ByteBuf },
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[serde(rename_all = "camelCase")]
 pub struct SnapiBarcode {
-    pub data: Vec<u8>,
+    pub data: ByteBuf,
     pub code_type: CodeType,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, FromPrimitive, IntoPrimitive)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u8)]
 pub enum SnapiAttributeRequest {
     GetId = 0x01,
@@ -410,16 +421,17 @@ impl serde::Serialize for SnapiAttributeRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[serde(rename_all = "lowercase", tag = "type", content = "value")]
 pub enum SnapiAttributeResponse {
     GetId(Vec<u16>),
     Get(Option<SnapiAttributeValue>),
-    GetOffset(Vec<u8>),
+    GetOffset(ByteBuf),
     Set,
     Store,
     Unknown {
         request: SnapiAttributeRequest,
-        data: Vec<u8>,
+        data: ByteBuf,
     },
 }
 
@@ -442,13 +454,15 @@ impl SnapiAttributeResponse {
             }
             SnapiAttributeRequest::GetOffset => {
                 require_length!(data, 13);
-                Ok(SnapiAttributeResponse::GetOffset(data[13..].to_vec()))
+                Ok(SnapiAttributeResponse::GetOffset(
+                    data[13..].to_vec().into(),
+                ))
             }
             SnapiAttributeRequest::Set => Ok(SnapiAttributeResponse::Set),
             SnapiAttributeRequest::Store => Ok(SnapiAttributeResponse::Store),
             request @ SnapiAttributeRequest::Unknown(_) => Ok(SnapiAttributeResponse::Unknown {
                 request,
-                data: data.to_vec(),
+                data: data.to_vec().into(),
             }),
         }
     }
@@ -484,11 +498,11 @@ pub enum SnapiAttributeValue {
     Word(u16),
     DWord(u32),
     String(String),
-    Array(Vec<u8>),
+    Array(ByteBuf),
     Action(u16),
     Unknown {
         attribute_type: SnapiAttributeType,
-        data: Vec<u8>,
+        data: ByteBuf,
     },
 }
 
@@ -549,7 +563,7 @@ impl SnapiAttributeValue {
                                 "expected string but not valid utf-8, returning as array: {}",
                                 hex::encode(&bytes)
                             );
-                            SnapiAttributeValue::Array(bytes)
+                            SnapiAttributeValue::Array(bytes.into())
                         })
                 }
             }
@@ -563,13 +577,13 @@ impl SnapiAttributeValue {
                         got: data,
                     });
                 } else {
-                    SnapiAttributeValue::Array(data)
+                    SnapiAttributeValue::Array(data.into())
                 }
             }
             SnapiAttributeType::Empty => return Ok(None),
             attribute_type => SnapiAttributeValue::Unknown {
                 attribute_type,
-                data: data.to_vec(),
+                data: data.to_vec().into(),
             },
         };
 

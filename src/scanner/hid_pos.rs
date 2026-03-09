@@ -1,5 +1,6 @@
 use futures::{SinkExt, Stream, StreamExt, channel::mpsc};
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use tracing::{error, trace, warn};
 
 use crate::transports::hid::HidDevice;
@@ -15,7 +16,7 @@ pub struct HidPos<H> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HidData {
     pub symbology_id: [u8; 3],
-    pub value: Vec<u8>,
+    pub value: ByteBuf,
 }
 
 impl<H: HidDevice> HidPos<H> {
@@ -62,7 +63,7 @@ impl<H: HidDevice> HidPos<H> {
 
                 let hid_data = HidData {
                     symbology_id: symbology_id.try_into().unwrap(),
-                    value: data,
+                    value: data.into(),
                 };
 
                 if let Err(err) = tx.send(hid_data).await {

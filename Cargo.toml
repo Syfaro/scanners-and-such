@@ -42,6 +42,7 @@ hex = "0.4.3"
 itertools = "0.14.0"
 num_enum = { version = "0.7.5" }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_bytes = "0.11.19"
 thiserror = "2.0.17"
 tracing = "0.1.41"
 tsify = { version = "0.5.6", optional = true, features = ["js"] }

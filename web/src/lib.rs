@@ -75,7 +75,10 @@ impl SnapiDeviceManager {
     pub async fn start(
         &self,
         #[wasm_bindgen(param_description = "HID device to use")] device: web_sys::HidDevice,
-        #[wasm_bindgen(param_description = "callback to be executed on every complete output")]
+        #[wasm_bindgen(
+            param_description = "callback to be executed on every complete output",
+            unchecked_param_type = "(value: SnapiOutput) => void"
+        )]
         callback: js_sys::Function,
     ) -> Result<(), JsError> {
         let (device, packets) = HidDevice::new::<{ snapi::packet::PACKET_LEN }>(device).await?;
@@ -145,7 +148,11 @@ impl SnapiDeviceManager {
     #[wasm_bindgen(js_name = "attachUsbDevice")]
     pub async fn attach_usb_device(
         &self,
-        device: web_sys::UsbDevice,
+        #[wasm_bindgen(param_description = "USB device to use")] device: web_sys::UsbDevice,
+        #[wasm_bindgen(
+            param_description = "callback to be executed on every complete output",
+            unchecked_param_type = "(data: Uint8Array) => void"
+        )]
         callback: js_sys::Function,
     ) -> Result<(), JsError> {
         let device = scanners_and_such::transports::usb::web::UsbDeviceWeb::new(device)
@@ -185,7 +192,11 @@ impl SnapiDeviceManager {
     }
 
     #[wasm_bindgen(js_name = "setMode")]
-    pub async fn set_mode(&self, mode: snapi::SnapiMode) -> Result<(), JsError> {
+    pub async fn set_mode(
+        &self,
+        #[wasm_bindgen(param_description = "the mode which should be set on the scanner")]
+        mode: snapi::SnapiMode,
+    ) -> Result<(), JsError> {
         self.device
             .lock()
             .await
@@ -323,7 +334,10 @@ impl HidPosManager {
     pub async fn start(
         &self,
         #[wasm_bindgen(param_description = "HID device to use")] device: web_sys::HidDevice,
-        #[wasm_bindgen(param_description = "callback to be executed on every complete output")]
+        #[wasm_bindgen(
+            param_description = "callback to be executed on every complete output",
+            unchecked_param_type = "(value: HidData) => void"
+        )]
         callback: js_sys::Function,
     ) -> Result<(), JsError> {
         let (device, packets) = HidDevice::new::<{ hid_pos::PACKET_LEN }>(device).await?;

@@ -1,6 +1,7 @@
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u16)]
 pub enum CodeType {
     Code39 = 0x01,

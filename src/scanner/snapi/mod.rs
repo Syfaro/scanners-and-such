@@ -25,6 +25,7 @@ pub const USB_VENDOR_ID: u16 = 0x05E0;
 pub const USB_PRODUCT_ID: u16 = 0x1900;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u8)]
 pub enum HidInput {
     Status = 0x21,
@@ -45,6 +46,7 @@ impl serde::Serialize for HidInput {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u8)]
 pub enum HidOutput {
     Acknowledgement = 0x01,
@@ -68,6 +70,7 @@ impl serde::Serialize for HidOutput {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, IntoPrimitive, FromPrimitive)]
+#[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u8)]
 pub enum SnapiNotification {
     BarcodeMode = 0x10,
@@ -368,7 +371,7 @@ impl<H: HidDevice, U> Snapi<H, U> {
                     }
                 }
 
-                Ok(Some(SnapiAttributeValue::Array(got)))
+                Ok(Some(SnapiAttributeValue::Array(got.into())))
             }
             Err(err) => return Err(err),
         }
@@ -547,7 +550,10 @@ impl<H: HidDevice, U> Snapi<H, U> {
             SnapiPacket::Barcode(packet) => packet.collate(&mut self.barcode_packets)?.output(),
             SnapiPacket::Notification(notification) => notification.output(),
             SnapiPacket::Attribute(packet) => packet.collate(&mut self.attribute_packets)?.output(),
-            SnapiPacket::Other { hid_input, data } => Some(SnapiOutput::Other { hid_input, data }),
+            SnapiPacket::Other { hid_input, data } => Some(SnapiOutput::Other {
+                hid_input,
+                data: data.into(),
+            }),
         };
         trace!(?output, "got collate output");
 
