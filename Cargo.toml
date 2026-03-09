@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Syfaro <syfaro@huefox.com>"]
 publish = false
+repository = "https://github.com/Syfaro/scanners-and-such"
 
 [package.metadata.release]
 shared-version = true
