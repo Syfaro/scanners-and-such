@@ -4,7 +4,7 @@ use std::{rc::Rc, sync::atomic::AtomicBool};
 
 use futures::{StreamExt, lock::Mutex};
 use scanners_and_such::{
-    scanner::snapi,
+    scanner::{hid_pos, snapi},
     transports::{hid::HidDevice, usb::UsbDevice},
 };
 use tracing::{debug, error};
@@ -297,6 +297,72 @@ impl SnapiDeviceManager {
             .ok_or_else(|| JsError::new("device not yet started"))?
             .set_attribute(attribute_id, store, value)
             .await?;
+
+        Ok(())
+    }
+}
+
+type HidPosDevice = hid_pos::HidPos<scanners_and_such::transports::hid::web::HidDeviceWeb>;
+
+#[wasm_bindgen(js_name = "HidPosDevice")]
+#[derive(Default)]
+pub struct HidPosManager {
+    device: Rc<Mutex<Option<HidPosDevice>>>,
+
+    is_running: Rc<AtomicBool>,
+}
+
+#[wasm_bindgen(js_class = "HidPosDevice")]
+impl HidPosManager {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[wasm_bindgen(js_name = "start")]
+    pub async fn start(
+        &self,
+        #[wasm_bindgen(param_description = "HID device to use")] device: web_sys::HidDevice,
+        #[wasm_bindgen(param_description = "callback to be executed on every complete output")]
+        callback: js_sys::Function,
+    ) -> Result<(), JsError> {
+        let (device, packets) = HidDevice::new::<{ hid_pos::PACKET_LEN }>(device).await?;
+        let (device, mut packets) = hid_pos::HidPos::new(device, packets).await;
+
+        *self.device.lock().await = Some(device);
+        self.is_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let is_running = Rc::clone(&self.is_running);
+
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(packet) = packets.next().await {
+                let value = serde_wasm_bindgen::to_value(&packet)
+                    .expect("it should always be possible to serialize HidData");
+
+                if let Err(err) = callback.call1(&JsValue::null(), &value) {
+                    error!("could not call provided function: {err:?}");
+                }
+            }
+
+            if is_running.load(std::sync::atomic::Ordering::SeqCst) {
+                error!("packet stream ended while device was running");
+            } else {
+                debug!("packet stream ended because of device shutdown");
+            }
+        });
+
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn close(&self) -> Result<(), JsError> {
+        self.is_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        if let Some(device) = self.device.lock().await.take() {
+            device.close().await?;
+        }
 
         Ok(())
     }

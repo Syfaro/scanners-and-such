@@ -713,7 +713,7 @@ impl<H: HidDevice, U: UsbDevice + 'static> Snapi<H, U> {
     }
 
     pub async fn detach_usb_device(&mut self) -> Result<Option<U>, SnapiError> {
-        self.cancel_usb_tasks();
+        self.cancel_usb_tasks().await;
 
         Ok(self.usb.take().map(|usb| usb.0))
     }

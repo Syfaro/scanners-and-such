@@ -15,6 +15,7 @@ hid = ["async-hid"]
 usb = ["nusb"]
 
 snapi = ["hid", "usb"]
+hid-pos = ["hid"]
 
 runtime-smol = ["smol", "nusb/smol"]
 runtime-tokio = ["tokio", "tokio/io-util", "nusb/tokio"]
@@ -52,6 +53,7 @@ web-sys = { version = "0.3.81", features = [
     "Event",
     "Hid",
     "HidDevice",
+    "HidDeviceFilter",
     "HidDeviceRequestOptions",
     "HidInputReportEvent",
     "Navigator",
@@ -73,3 +75,8 @@ tracing-test = "0.2.5"
 name = "snapi-devices"
 path = "examples/snapi-devices.rs"
 required-features = ["snapi", "runtime-smol"]
+
+[[example]]
+name = "hid-pos"
+path = "examples/hid-pos.rs"
+required-features = ["hid-pos", "runtime-smol"]

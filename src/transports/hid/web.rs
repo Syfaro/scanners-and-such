@@ -3,8 +3,8 @@ use futures::{SinkExt, Stream, channel::mpsc};
 use tracing::{error, trace};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Event, HidDeviceRequestOptions, HidInputReportEvent,
-    js_sys::{Array, Reflect, Uint8Array},
+    Event, HidDeviceFilter, HidDeviceRequestOptions, HidInputReportEvent,
+    js_sys::{Reflect, Uint8Array},
     wasm_bindgen::{JsCast, JsValue, prelude::Closure},
 };
 
@@ -71,16 +71,6 @@ impl HidTransportWeb {
 
         Ok(navigator.hid())
     }
-
-    fn extract_devices(value: JsValue) -> Result<Vec<web_sys::HidDevice>, WebHidError> {
-        value
-            .dyn_into::<Array>()
-            .map_err(|_err| WebHidError::new("hid devices were not array"))?
-            .into_iter()
-            .map(|device| device.dyn_into::<web_sys::HidDevice>())
-            .collect::<Result<_, _>>()
-            .map_err(|_err| WebHidError::new("returned object was not hid device"))
-    }
 }
 
 #[async_trait(?Send)]
@@ -89,8 +79,16 @@ impl HidTransport for HidTransportWeb {
     type Error = WebHidError;
 
     async fn get_devices(filters: &[UsbFilter]) -> Result<Vec<web_sys::HidDevice>, WebHidError> {
-        let filters = serde_wasm_bindgen::to_value(filters)
-            .map_err(|_err| WebHidError::new("failed to serialize filters"))?;
+        let filters: Vec<_> = filters
+            .iter()
+            .map(|filter| {
+                let hid_filter = HidDeviceFilter::new();
+                hid_filter.set_vendor_id(filter.vendor_id.into());
+                hid_filter.set_product_id(filter.product_id);
+                hid_filter
+            })
+            .collect();
+
         let request_opts = HidDeviceRequestOptions::new(&filters);
 
         let hid = Self::get_hid()?;
@@ -99,7 +97,7 @@ impl HidTransport for HidTransportWeb {
             .await
             .map_err(|_err| WebHidError::new("request device call failed"))?;
 
-        Self::extract_devices(devices)
+        Ok(devices.to_vec())
     }
 }
 

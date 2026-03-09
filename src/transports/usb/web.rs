@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    UsbDeviceRequestOptions, UsbInTransferResult,
+    UsbDeviceFilter, UsbDeviceRequestOptions, UsbInTransferResult,
     js_sys::{Reflect, Uint8Array},
     wasm_bindgen::{JsCast, JsError, JsValue},
 };
@@ -38,7 +38,17 @@ impl UsbTransport for UsbTransportWeb {
     ) -> Result<Vec<Self::DiscoveredDevice>, Self::Error> {
         let usb = Self::get_usb()?;
 
-        let options = UsbDeviceRequestOptions::new(&serde_wasm_bindgen::to_value(&filters)?);
+        let filters: Vec<_> = filters
+            .iter()
+            .map(|filter| {
+                let usb_filter = UsbDeviceFilter::new();
+                usb_filter.set_vendor_id(filter.vendor_id);
+                usb_filter.set_product_id(filter.product_id);
+                usb_filter
+            })
+            .collect();
+
+        let options = UsbDeviceRequestOptions::new(&filters);
 
         let device = JsFuture::from(usb.request_device(&options))
             .await
