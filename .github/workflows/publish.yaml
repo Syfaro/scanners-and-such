@@ -37,3 +37,5 @@ jobs:
 
       - name: Publish web package
         run: npm publish web/pkg/syfaro-scanners-and-such-web-${VERSION}.tgz --access=public
+        env:
+          NPM_CONFIG_PROVENANCE: true
