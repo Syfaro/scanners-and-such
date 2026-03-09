@@ -5,8 +5,16 @@ edition = "2024"
 authors = ["Syfaro <syfaro@huefox.com>"]
 publish = false
 
+[package.metadata.release]
+shared-version = true
+
 [workspace]
 members = [".", "web"]
+
+[workspace.metadata.release]
+sign-tag = true
+shared-version = true
+tag-name = "v{{version}}"
 
 [features]
 default = []
