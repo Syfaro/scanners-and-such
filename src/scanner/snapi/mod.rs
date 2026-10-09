@@ -199,8 +199,8 @@ impl<H: HidDevice, U> Snapi<H, U> {
     pub async fn new(
         hid: H,
         packets: impl Stream<Item = Vec<u8>> + Send + 'static,
-    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), SnapiError> {
-        let (others_tx, others_rx) = mpsc::channel(8);
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Vec<u8>>), SnapiError> {
+        let (others_tx, others_rx) = mpsc::unbounded();
         let pending = Pending::new(others_tx);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -767,15 +767,15 @@ impl<H, U> Drop for Snapi<H, U> {
 /// registering the expected output with a channel for processing.
 struct Pending<T> {
     /// The general event stream for non-reserved packets.
-    others: Mutex<mpsc::Sender<T>>,
+    others: mpsc::UnboundedSender<T>,
     /// A collection of subscribers for specific HID inputs.
     subscribers: Mutex<HashMap<HidInput, PendingSender<T>>>,
 }
 
 impl<T> Pending<T> {
-    fn new(others: mpsc::Sender<T>) -> Arc<Self> {
+    fn new(others: mpsc::UnboundedSender<T>) -> Arc<Self> {
         Arc::new(Self {
-            others: Mutex::new(others),
+            others,
             subscribers: Default::default(),
         })
     }
@@ -791,10 +791,7 @@ impl<T> Pending<T> {
             trace!(single_use, "sent pending request");
         } else {
             self.others
-                .lock()
-                .await
-                .send(data)
-                .await
+                .unbounded_send(data)
                 .map_err(|_| SnapiError::Channel { name: "others" })?;
             trace!("sent input event");
         }
