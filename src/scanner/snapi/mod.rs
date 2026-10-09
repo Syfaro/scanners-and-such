@@ -37,6 +37,12 @@ pub enum HidInput {
     Unknown(u8),
 }
 
+impl HidInput {
+    pub fn requires_ack(self) -> bool {
+        self != HidInput::Status
+    }
+}
+
 impl serde::Serialize for HidInput {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -232,7 +238,7 @@ impl<H: HidDevice, U> Snapi<H, U> {
     pub async fn write_ack(&mut self, input: HidInput) -> Result<(), SnapiError> {
         self.write_command(
             HidOutput::Acknowledgement,
-            &mut [HidOutput::Acknowledgement.into(), input.into(), 0x01],
+            &mut [HidOutput::Acknowledgement.into(), input.into(), 0x01, 0x00],
             false,
         )
         .await
@@ -547,7 +553,9 @@ impl<H: HidDevice, U> Snapi<H, U> {
         let hid_input = HidInput::from(data[0]);
         trace!(?hid_input, "processing data");
 
-        self.write_ack(hid_input).await?;
+        if hid_input.requires_ack() {
+            self.write_ack(hid_input).await?;
+        }
 
         let packet = SnapiPacket::decode_any(&data)?;
         trace!(?packet, "decoded packet");
