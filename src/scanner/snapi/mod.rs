@@ -31,6 +31,7 @@ pub enum HidInput {
     Status = 0x21,
     Barcode = 0x22,
     Notification = 0x24,
+    ExtendedBarcode = 0x26,
     Attribute = 0x27,
     #[num_enum(catch_all)]
     Unknown(u8),

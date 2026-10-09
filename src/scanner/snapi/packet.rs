@@ -25,6 +25,7 @@ impl SnapiPacket {
             HidInput::Status => SnapiStatus::decode(data)?.packet(),
             HidInput::Barcode => SnapiBarcodePacket::decode(data)?.packet(),
             HidInput::Notification => SnapiNotification::decode(data)?.packet(),
+            HidInput::ExtendedBarcode => SnapiBarcodePacket::decode_extended(data)?.packet(),
             HidInput::Attribute => SnapiAttributePacket::decode(data)?.packet(),
             hid_input => SnapiPacket::Other {
                 hid_input,
@@ -200,6 +201,26 @@ pub struct SnapiBarcodePacket {
 
     pub code_type: CodeType,
     pub data: Vec<u8>,
+}
+
+impl SnapiBarcodePacket {
+    pub fn decode_extended(data: &[u8]) -> Result<Self, SnapiError> {
+        require_length!(data, 8);
+        let packet_count = usize::from(u16::from_le_bytes([data[1], data[2]]));
+        let packet_index = usize::from(u16::from_le_bytes([data[3], data[4]]));
+        let length = usize::from(data[5]);
+        let code_type = CodeType::from(u16::from_le_bytes([data[6], data[7]]));
+
+        require_length!(data, 8 + length);
+        let data = data[8..(8 + length)].to_vec();
+
+        Ok(Self {
+            packet_count,
+            packet_index,
+            code_type,
+            data,
+        })
+    }
 }
 
 impl DecodableSnapiPacket for SnapiBarcodePacket {
