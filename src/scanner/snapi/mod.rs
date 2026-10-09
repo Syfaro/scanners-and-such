@@ -73,6 +73,12 @@ impl serde::Serialize for HidOutput {
 #[cfg_attr(feature = "web", derive(tsify::Tsify))]
 #[repr(u8)]
 pub enum SnapiNotification {
+    DecodeEvent = 0x01,
+    PowerUp = 0x03,
+    ParameterEntryError = 0x07,
+    ParameterStored = 0x08,
+    ParameterDefaults = 0x0A,
+    ParameterNumberExpected = 0x0F,
     BarcodeMode = 0x10,
     ImageMode = 0x11,
     VideoMode = 0x12,
