@@ -536,11 +536,11 @@ impl SnapiAttributeValue {
             }
             SnapiAttributeType::Word => {
                 require_length!(data, 9);
-                SnapiAttributeValue::Word(u16::from_le_bytes([data[8], data[9]]))
+                SnapiAttributeValue::Word(u16::from_be_bytes([data[8], data[9]]))
             }
             SnapiAttributeType::DWord => {
                 require_length!(data, 11);
-                SnapiAttributeValue::DWord(u32::from_le_bytes([
+                SnapiAttributeValue::DWord(u32::from_be_bytes([
                     data[8], data[9], data[10], data[11],
                 ]))
             }
