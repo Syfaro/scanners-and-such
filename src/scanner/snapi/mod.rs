@@ -3,22 +3,19 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use futures::{
     SinkExt, Stream, StreamExt,
     channel::{mpsc, oneshot},
-    future::Either,
     lock::Mutex,
 };
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
-use tracing::{Instrument, debug, error, info, instrument, trace, warn};
+use tracing::{Instrument, debug, error, instrument, trace, warn};
 
 use crate::{
     scanner::snapi::packet::*,
-    transports::{
-        hid::HidDevice,
-        usb::{UsbDevice, UsbDeviceTransportInput},
-    },
+    transports::{hid::HidDevice, usb::UsbDevice},
 };
 
 pub mod code_types;
+mod image;
 pub mod packet;
 
 pub const USB_VENDOR_ID: u16 = 0x05E0;
@@ -124,6 +121,8 @@ impl serde::Serialize for SnapiNotification {
 pub enum SnapiError {
     #[error("hid error: {message}")]
     Hid { message: String },
+    #[error("image length {len} is not between 1 and {max} bytes")]
+    InvalidImageLength { len: u32, max: usize },
     #[error("unexpected value {value:02X} when parsing field {name}")]
     UnexpectedValue { value: u8, name: Cow<'static, str> },
     #[error("got bad response code: {:?}", status.response_code)]
@@ -168,8 +167,10 @@ pub struct Snapi<H, U = ()> {
     barcode_packets: Vec<SnapiBarcodePacket>,
     attribute_packets: Vec<SnapiAttributePacket>,
 
-    usb: Option<(U, mpsc::Sender<Result<SnapiData, SnapiError>>)>,
+    usb: Option<U>,
     cancel_usb_tasks: HashMap<u8, oneshot::Sender<oneshot::Sender<()>>>,
+
+    max_image_len: usize,
 }
 
 #[cfg_attr(feature = "web", derive(tsify::Tsify))]
@@ -219,6 +220,8 @@ impl<H: HidDevice, U> Snapi<H, U> {
 
             usb: None,
             cancel_usb_tasks: HashMap::new(),
+
+            max_image_len: image::DEFAULT_MAX_BODY_LEN,
         };
 
         // Spawn reader after creating device, because now device will send a
@@ -610,6 +613,10 @@ impl<H: HidDevice, U> Snapi<H, U> {
 }
 
 impl<H: HidDevice, U: UsbDevice + 'static> Snapi<H, U> {
+    pub fn set_max_image_len(&mut self, max_image_len: usize) {
+        self.max_image_len = max_image_len;
+    }
+
     pub async fn attach_usb_device(
         &mut self,
         mut usb_device: U,
@@ -627,108 +634,27 @@ impl<H: HidDevice, U: UsbDevice + 'static> Snapi<H, U> {
         let (data_tx, data_rx) = mpsc::channel(0);
 
         for (address, mode) in [(0x82, SnapiMode::Image), (0x83, SnapiMode::Video)] {
-            let mut endpoint = usb_device
+            let endpoint = usb_device
                 .claim_bulk_input_endpoint(1, address, 4096)
                 .await
                 .map_err(SnapiError::usb)?;
 
-            let (cancel_tx, mut cancel_rx) = oneshot::channel();
+            let (cancel_tx, cancel_rx) = oneshot::channel();
             self.cancel_usb_tasks.insert(address, cancel_tx);
 
-            let mut data_tx = data_tx.clone();
-
             crate::runtime::spawn(
-                async move {
-                    let mut buf = [0u8; 4096];
-
-                    // General loop for new USB packets
-                    loop {
-                        let mut header = Vec::with_capacity(32);
-                        let mut body = Vec::new();
-
-                        while header.len() < 32 {
-                            trace!("waiting for header data");
-                            // We should only cancel when waiting for headers.
-                            let fut = endpoint.transfer_in(&mut buf);
-                            let len = match futures::future::select(&mut cancel_rx, fut).await {
-                                Either::Left((tx, _)) => {
-                                    info!("usb task cancelled");
-                                    if let Ok(tx) = tx {
-                                        let _ = tx.send(());
-                                    }
-                                    return;
-                                }
-                                Either::Right((res, _)) => match res {
-                                    Ok(len) => len,
-                                    Err(err) => {
-                                        error!("usb error: {err:?}");
-                                        return;
-                                    }
-                                },
-                            };
-
-                            let header_bytes = std::cmp::min(len, 32 - header.len());
-                            header.extend_from_slice(&buf[..header_bytes]);
-
-                            trace!(
-                                packet_len = len,
-                                header_len = header.len(),
-                                "updated usb header information: {}",
-                                hex::encode(&header)
-                            );
-
-                            if len > header_bytes {
-                                trace!(
-                                    additional_len = len - header_bytes,
-                                    "adding additional bytes to body"
-                                );
-                                body.extend_from_slice(&buf[header_bytes..]);
-                            }
-                        }
-
-                        let total_len: usize =
-                            u32::from_le_bytes([header[0], header[1], header[2], header[3]])
-                                .try_into()
-                                .expect("u32 should always fit into usize");
-                        debug!("expecting {total_len} bytes");
-                        body.reserve_exact(total_len - body.len());
-
-                        loop {
-                            let len = match endpoint.transfer_in(&mut buf).await {
-                                Ok(len) => len,
-                                Err(err) => {
-                                    error!("usb error: {err:?}");
-                                    return;
-                                }
-                            };
-                            body.extend_from_slice(&buf[..len]);
-                            debug!(
-                                len,
-                                total_len,
-                                body_len = body.len(),
-                                finished = body.len() == total_len,
-                                "read more bytes"
-                            );
-
-                            if body.len() == total_len {
-                                break;
-                            }
-                        }
-
-                        if data_tx
-                            .send(Ok(SnapiData { mode, header, body }))
-                            .await
-                            .is_err()
-                        {
-                            error!("could not send snapi data");
-                        }
-                    }
-                }
+                image::read_endpoint(
+                    endpoint,
+                    mode,
+                    image::ImageAssembler::new(self.max_image_len),
+                    cancel_rx,
+                    data_tx.clone(),
+                )
                 .instrument(tracing::info_span!("usb_poll_loop", address)),
             );
         }
 
-        self.usb = Some((usb_device, data_tx));
+        self.usb = Some(usb_device);
 
         Ok(data_rx)
     }
@@ -736,7 +662,7 @@ impl<H: HidDevice, U: UsbDevice + 'static> Snapi<H, U> {
     pub async fn detach_usb_device(&mut self) -> Result<Option<U>, SnapiError> {
         self.cancel_usb_tasks().await;
 
-        Ok(self.usb.take().map(|usb| usb.0))
+        Ok(self.usb.take())
     }
 }
 
