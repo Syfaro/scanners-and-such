@@ -786,7 +786,19 @@ impl<T> Pending<T> {
     /// certain inputs or the general event stream.
     #[instrument(skip(self, data))]
     async fn send_for_input(&self, hid_input: HidInput, data: T) -> Result<(), SnapiError> {
-        if let Some(tx) = self.subscribers.lock().await.get_mut(&hid_input) {
+        let tx = {
+            let mut subscribers = self.subscribers.lock().await;
+            match subscribers.get_mut(&hid_input) {
+                Some(PendingSender::Single(tx)) => {
+                    let tx = tx.take();
+                    subscribers.remove(&hid_input);
+                    tx.map(|tx| PendingSender::Single(Some(tx)))
+                }
+                Some(PendingSender::Multiple(tx)) => Some(PendingSender::Multiple(tx.clone())),
+                None => None,
+            }
+        };
+        if let Some(mut tx) = tx {
             let single_use = tx.send(data).await?;
             trace!(single_use, "sent pending request");
         } else {
